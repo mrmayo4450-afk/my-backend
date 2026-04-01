@@ -539,7 +539,9 @@ async function notifyDataSync(entity: string, action: string, id?: string) {
 }
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
-  const isProduction = process.env.NODE_ENV === "production";
+  const isProduction = process.env.NODE_ENV === "production"
+    || !!process.env.RAILWAY_ENVIRONMENT
+    || !!process.env.RAILWAY_PROJECT_ID;
 
   // Note: DB connections are managed exclusively by the shared pool in storage.ts.
 
