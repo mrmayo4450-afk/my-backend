@@ -7,6 +7,7 @@ import cors from "cors";
 import passport from "passport";
 import { Strategy as LocalStrategy } from "passport-local";
 import crypto from "crypto";
+import jwt from "jsonwebtoken";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
@@ -417,6 +418,21 @@ function hashPassword(password: string): string {
   return crypto.createHash("sha256").update(password + "marketplacesalt").digest("hex");
 }
 
+const JWT_SECRET = process.env.SESSION_SECRET || "marketplace-secret-2024";
+
+function generateToken(userId: string): string {
+  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "7d" });
+}
+
+function verifyToken(token: string): { userId: string } | null {
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as any;
+    return { userId: payload.userId };
+  } catch {
+    return null;
+  }
+}
+
 // ─── Image storage helpers ───────────────────────────────────────────────────
 // Base64 images are stored in the product_images table so product rows stay
 // small (only a tiny URL reference is kept).  Any existing URL is passed
@@ -483,17 +499,33 @@ async function applyPendingImages(productId: string, base64ImageUrl: string | nu
 
 function isAuthenticated(req: Request, res: Response, next: any) {
   if (req.isAuthenticated()) return next();
+
+  const authHeader = req.headers.authorization as string | undefined;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    const tokenPayload = verifyToken(authHeader.slice(7));
+    if (tokenPayload) {
+      storage.getUser(tokenPayload.userId)
+        .then(user => {
+          if (!user) return res.status(401).json({ message: "Unauthorized" });
+          (req as any).user = user;
+          next();
+        })
+        .catch(() => res.status(401).json({ message: "Unauthorized" }));
+      return;
+    }
+  }
+
   res.status(401).json({ message: "Unauthorized" });
 }
 
 function isAdmin(req: Request, res: Response, next: any) {
   const role = (req.user as any)?.role;
-  if (req.isAuthenticated() && (role === "admin" || role === "superadmin")) return next();
+  if (role === "admin" || role === "superadmin") return next();
   res.status(403).json({ message: "Forbidden" });
 }
 
 function isSuperAdmin(req: Request, res: Response, next: any) {
-  if (req.isAuthenticated() && (req.user as any)?.role === "superadmin") return next();
+  if ((req.user as any)?.role === "superadmin") return next();
   res.status(403).json({ message: "Forbidden" });
 }
 
@@ -762,7 +794,8 @@ ${pages.map(p => `  <url>
       req.login(user, (err) => {
         if (err) return res.status(500).json({ message: "Login failed after registration" });
         const { password, ...safeUser } = user;
-        res.json(safeUser);
+        const token = generateToken(user.id);
+        res.json({ ...safeUser, token });
       });
     } catch (err: any) {
       res.status(500).json({ message: err.message });
@@ -776,7 +809,8 @@ ${pages.map(p => `  <url>
       req.login(user, (err) => {
         if (err) return next(err);
         const { password, ...safeUser } = user;
-        res.json(safeUser);
+        const token = generateToken(user.id);
+        res.json({ ...safeUser, token });
       });
     })(req, res, next);
   });
@@ -785,9 +819,25 @@ ${pages.map(p => `  <url>
     req.logout(() => res.json({ message: "Logged out" }));
   });
 
-  app.get("/api/auth/me", isAuthenticated, (req, res) => {
-    const { password, ...safeUser } = req.user as any;
-    res.json(safeUser);
+  app.get("/api/auth/me", async (req, res) => {
+    if (req.isAuthenticated()) {
+      const { password, ...safeUser } = req.user as any;
+      return res.json(safeUser);
+    }
+    const authHeader = req.headers.authorization as string | undefined;
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      const tokenPayload = verifyToken(authHeader.slice(7));
+      if (tokenPayload) {
+        try {
+          const user = await storage.getUser(tokenPayload.userId);
+          if (user) {
+            const { password, ...safeUser } = user;
+            return res.json(safeUser);
+          }
+        } catch {}
+      }
+    }
+    res.status(401).json({ message: "Unauthorized" });
   });
 
   app.patch("/api/users/profile", isAuthenticated, isNotFrozen, async (req, res) => {
