@@ -2407,6 +2407,17 @@ Leave any image cell blank if no photo exists for that slot.
     res.json({ message: "Unpinned" });
   });
 
+  app.delete("/api/chat/messages/:id", isAuthenticated, async (req, res) => {
+    const userId = (req.user as any).id;
+    const role = (req.user as any).role;
+    const msgs = await storage.getAllChatMessages();
+    const msg = msgs.find(m => m.id === req.params.id);
+    if (!msg) return res.status(404).json({ message: "Message not found" });
+    if (role !== "superadmin" && msg.senderId !== userId) return res.status(403).json({ message: "Cannot delete this message" });
+    await storage.deleteChatMessage(req.params.id);
+    res.json({ message: "Deleted" });
+  });
+
   app.patch("/api/users/:id", isAuthenticated, isAdmin, async (req, res) => {
     const linkedIds = await getLinkedUserIds(req);
     if (linkedIds !== null && !linkedIds.includes(req.params.id)) {
