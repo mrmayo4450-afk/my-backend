@@ -113,6 +113,7 @@ export interface IStorage {
   pinChatMessage(id: string): Promise<ChatMessage | undefined>;
   unpinAllChatMessages(): Promise<void>;
   getPinnedChatMessage(): Promise<ChatMessage | undefined>;
+  deleteChatMessage(id: string): Promise<void>;
 
   getWithdrawal(id: string): Promise<Withdrawal | undefined>;
   getWithdrawalsByUser(userId: string): Promise<Withdrawal[]>;
@@ -372,6 +373,10 @@ export class DatabaseStorage implements IStorage {
   async getPinnedChatMessage(): Promise<ChatMessage | undefined> {
     const [msg] = await db.select().from(chatMessages).where(eq(chatMessages.isPinned, true)).limit(1);
     return msg;
+  }
+
+  async deleteChatMessage(id: string): Promise<void> {
+    await db.delete(chatMessages).where(eq(chatMessages.id, id));
   }
 
   async getWithdrawal(id: string): Promise<Withdrawal | undefined> {
