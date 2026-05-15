@@ -146,6 +146,7 @@ export interface IStorage {
   updateBulkOrder(id: string, data: Partial<BulkOrder>): Promise<BulkOrder | undefined>;
   createBulkOrderItem(data: InsertBulkOrderItem): Promise<BulkOrderItem>;
   getBulkOrderItems(bulkOrderId: string): Promise<BulkOrderItem[]>;
+  getAllBulkOrderItems(): Promise<BulkOrderItem[]>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -524,6 +525,10 @@ export class DatabaseStorage implements IStorage {
 
   async getBulkOrderItems(bulkOrderId: string): Promise<BulkOrderItem[]> {
     return db.select().from(bulkOrderItems).where(eq(bulkOrderItems.bulkOrderId, bulkOrderId));
+  }
+
+  async getAllBulkOrderItems(): Promise<BulkOrderItem[]> {
+    return db.select().from(bulkOrderItems);
   }
 }
 
