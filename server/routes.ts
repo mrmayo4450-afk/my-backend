@@ -1889,20 +1889,45 @@ Leave any image cell blank if no photo exists for that slot.
   // Admin: list all bulk orders (with items)
   app.get("/api/admin/bulk-orders", isAuthenticated, isAdmin, async (req, res) => {
     try {
-      const allOrders = await storage.getAllBulkOrders();
-      // Auto-expire pending orders past their expiry time
+      // Fetch orders + all items in 2 queries, then batch-fetch stores/users to avoid N+1
+      const [allOrders, allItems] = await Promise.all([
+        storage.getAllBulkOrders(),
+        storage.getAllBulkOrderItems(),
+      ]);
+
+      // Auto-expire pending orders past their expiry time (sequential, only for expired ones)
       const now = new Date();
-      const withItems = await Promise.all(allOrders.map(async (bo) => {
-        let order = bo;
-        if (bo.status === "pending" && new Date(bo.expiresAt) < now) {
-          const expired = await storage.updateBulkOrder(bo.id, { status: "expired" });
-          order = expired || bo;
-        }
-        const items = await storage.getBulkOrderItems(bo.id);
-        const store = await storage.getStore(bo.storeId);
-        const admin = await storage.getUser(bo.adminId);
-        return { ...order, items, storeName: store?.name, adminUsername: admin?.username };
+      const expiredIds = allOrders
+        .filter(bo => bo.status === "pending" && new Date(bo.expiresAt) < now)
+        .map(bo => bo.id);
+      if (expiredIds.length > 0) {
+        await Promise.all(expiredIds.map(id => storage.updateBulkOrder(id, { status: "expired" })));
+      }
+
+      // Batch fetch unique stores and admins
+      const storeIds = [...new Set(allOrders.map(bo => bo.storeId))];
+      const adminIds = [...new Set(allOrders.map(bo => bo.adminId))];
+      const [storeRows, adminRows] = await Promise.all([
+        storeIds.length > 0 ? db.select().from(stores).where(inArray(stores.id, storeIds)) : Promise.resolve([]),
+        adminIds.length > 0 ? db.select({ id: users.id, username: users.username }).from(users).where(inArray(users.id, adminIds)) : Promise.resolve([]),
+      ]);
+
+      const storeMap = new Map(storeRows.map(s => [s.id, s]));
+      const adminMap = new Map(adminRows.map(u => [u.id, u]));
+      const itemsByOrder = new Map<string, typeof allItems>();
+      for (const item of allItems) {
+        if (!itemsByOrder.has(item.bulkOrderId)) itemsByOrder.set(item.bulkOrderId, []);
+        itemsByOrder.get(item.bulkOrderId)!.push(item);
+      }
+
+      const withItems = allOrders.map(bo => ({
+        ...bo,
+        status: expiredIds.includes(bo.id) ? "expired" : bo.status,
+        items: itemsByOrder.get(bo.id) ?? [],
+        storeName: storeMap.get(bo.storeId)?.name,
+        adminUsername: adminMap.get(bo.adminId)?.username,
       }));
+
       res.json(withItems);
     } catch (err: any) {
       res.status(500).json({ message: err.message });
