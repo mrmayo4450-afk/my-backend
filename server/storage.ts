@@ -47,11 +47,19 @@ const supabasePoolConfig = process.env.SUPA_HOST
       ssl: false as const,
     };
 
+function readPositiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value || "", 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 const pool = new Pool({
   ...supabasePoolConfig,
-  max: 3,                        // keep well under Supabase limits even with multiple restarts
-  idleTimeoutMillis: 10000,
-  connectionTimeoutMillis: 8000,
+  // Three connections are not enough when API queries and connect-pg-simple
+  // session reads share this pool. Keep the defaults conservative, but allow
+  // deployments to tune them without another code change.
+  max: readPositiveInteger(process.env.DB_POOL_MAX, 10),
+  idleTimeoutMillis: readPositiveInteger(process.env.DB_IDLE_TIMEOUT_MS, 30000),
+  connectionTimeoutMillis: readPositiveInteger(process.env.DB_CONNECTION_TIMEOUT_MS, 15000),
 });
 
 process.on("SIGTERM", () => pool.end());
