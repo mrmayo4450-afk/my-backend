@@ -57,7 +57,7 @@ const pool = new Pool({
   // Three connections are not enough when API queries and connect-pg-simple
   // session reads share this pool. Keep the defaults conservative, but allow
   // deployments to tune them without another code change.
-  max: readPositiveInteger(process.env.DB_POOL_MAX, 10),
+  max: readPositiveInteger(process.env.DB_POOL_MAX, isSupabasePooler ? 5 : 10),
   idleTimeoutMillis: readPositiveInteger(process.env.DB_IDLE_TIMEOUT_MS, 30000),
   connectionTimeoutMillis: readPositiveInteger(process.env.DB_CONNECTION_TIMEOUT_MS, 15000),
 });
