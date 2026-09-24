@@ -16,7 +16,7 @@ import archiver from "archiver";
 import { storage, db, pool } from "./storage";
 import { insertUserSchema, insertStoreSchema, insertProductSchema, insertOrderSchema, insertTargetSchema, insertWithdrawalSchema, insertNoticeSchema } from "@shared/schema";
 import { users, products, stores, orders, targets, chatMessages, withdrawals, merchantNotices, rechargeHistory, userDailyStats, productImages, backups, siteSettings, bulkOrders, bulkOrderItems } from "@shared/schema";
-import { eq, sql, inArray } from "drizzle-orm";
+import { eq, sql, inArray, and, desc, getTableColumns } from "drizzle-orm";
 import pkg from "pg";
 const { Client: PgClient } = pkg;
 
@@ -222,28 +222,34 @@ async function runPeriodicSync() {
 //  (~31MB) only runs when images actually change. On a full DB restore both are merged.
 
 let _backupTimer: ReturnType<typeof setTimeout> | null = null;
+let _backupInProgress = false;
+let _backupRunning = false;
+let _backupQueued = false;
 function scheduleBackup(delaySec = 5) {
+  if (_backupRunning) {
+    _backupQueued = true;
+    return;
+  }
   if (_backupTimer) clearTimeout(_backupTimer);
   _backupTimer = setTimeout(async () => {
     _backupTimer = null;
+    if (_backupInProgress) return scheduleBackup(5);
+    _backupInProgress = true;
+    _backupRunning = true;
     try {
-      const [
-        dbUsers, dbStores, dbProducts, dbOrders,
-        dbTargets, dbWithdrawals, dbChats, dbNotices,
-        dbRecharge, dbStats, dbSettings,
-      ] = await Promise.all([
-        db.select().from(users),
-        db.select().from(stores),
-        db.select().from(products),
-        db.select().from(orders),
-        db.select().from(targets),
-        db.select().from(withdrawals),
-        db.select().from(chatMessages),
-        db.select().from(merchantNotices),
-        db.select().from(rechargeHistory),
-        db.select().from(userDailyStats),
-        db.select().from(siteSettings),
-      ]);
+      // Do not use Promise.all: each query would check out another server-side
+      // connection and can starve session and API requests on a small pooler.
+      const dbUsers = await db.select().from(users);
+      const dbStores = await db.select().from(stores);
+      const dbProducts = await db.select().from(products);
+      const dbOrders = await db.select().from(orders);
+      const dbTargets = await db.select().from(targets);
+      const dbWithdrawals = await db.select().from(withdrawals);
+      const dbChats = await db.select().from(chatMessages);
+      const dbNotices = await db.select().from(merchantNotices);
+      const dbRecharge = await db.select().from(rechargeHistory);
+      const dbStats = await db.select().from(userDailyStats);
+      const dbSettings = await db.select().from(siteSettings);
       const payload = JSON.stringify({
         timestamp: new Date().toISOString(),
         version: 3,
@@ -254,7 +260,8 @@ function scheduleBackup(delaySec = 5) {
         siteSettings: dbSettings,
       });
       // Rotate: delete old 'previous', promote 'current' → 'previous', insert new 'current'
-      const metaRows = await db.select().from(backups).where(sql`label IN ('current','previous')`);
+      const metaRows = await db.select({ id: backups.id, label: backups.label })
+        .from(backups).where(sql`label IN ('current','previous')`);
       const prev = metaRows.find(r => r.label === "previous");
       const curr = metaRows.find(r => r.label === "current");
       if (prev) await db.delete(backups).where(eq(backups.id, prev.id));
@@ -263,6 +270,13 @@ function scheduleBackup(delaySec = 5) {
       console.log(`[backup] Supabase metadata backup updated — products: ${dbProducts.length}, orders: ${dbOrders.length}`);
     } catch (err) {
       console.error("[backup] Metadata backup failed:", err);
+    } finally {
+      _backupRunning = false;
+      _backupInProgress = false;
+      if (_backupQueued) {
+        _backupQueued = false;
+        scheduleBackup(5);
+      }
     }
   }, delaySec * 1000);
 }
@@ -897,8 +911,20 @@ ${pages.map(p => `  <url>
 
   // Stores routes
   app.get("/api/stores", async (req, res) => {
-    const allStores = await storage.getAllStores();
+    // NIC documents can be large and must never be included in a public list.
+    const { nicImageUrl, ...publicColumns } = getTableColumns(stores);
+    const allStores = await db.select(publicColumns).from(stores).orderBy(desc(stores.createdAt));
     res.json(allStores);
+  });
+
+  app.get("/api/admin/stores/pending-nics", isAuthenticated, isAdmin, async (req, res) => {
+    const ownerIds = await getLinkedUserIds(req);
+    if (ownerIds !== null && ownerIds.length === 0) return res.json([]);
+    const pending = await db.select({ id: stores.id, nicImageUrl: stores.nicImageUrl })
+      .from(stores).where(ownerIds === null
+        ? eq(stores.isApproved, false)
+        : and(eq(stores.isApproved, false), inArray(stores.ownerId, ownerIds)));
+    res.json(pending);
   });
 
   app.get("/api/stores/my", isAuthenticated, async (req, res) => {
@@ -910,7 +936,8 @@ ${pages.map(p => `  <url>
   app.get("/api/stores/:id", async (req, res) => {
     const store = await storage.getStore(req.params.id);
     if (!store) return res.status(404).json({ message: "Store not found" });
-    res.json(store);
+    const { nicImageUrl, ...publicStore } = store;
+    res.json(publicStore);
   });
 
   app.post("/api/stores", isAuthenticated, isNotFrozen, async (req, res) => {
