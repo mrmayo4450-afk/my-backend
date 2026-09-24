@@ -934,10 +934,10 @@ ${pages.map(p => `  <url>
   });
 
   app.get("/api/stores/:id", async (req, res) => {
-    const store = await storage.getStore(req.params.id);
+    const { nicImageUrl, ...publicColumns } = getTableColumns(stores);
+    const [store] = await db.select(publicColumns).from(stores).where(eq(stores.id, req.params.id)).limit(1);
     if (!store) return res.status(404).json({ message: "Store not found" });
-    const { nicImageUrl, ...publicStore } = store;
-    res.json(publicStore);
+    res.json(store);
   });
 
   app.post("/api/stores", isAuthenticated, isNotFrozen, async (req, res) => {
