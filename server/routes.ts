@@ -2810,24 +2810,24 @@ Leave any image cell blank if no photo exists for that slot.
   // Info about the two Supabase cloud backups (current + previous)
   app.get("/api/admin/supabase-backup/info", isAuthenticated, isSuperAdmin, async (req, res) => {
     try {
-      const rows = await db.select().from(backups);
+      // Calculate counts in Postgres; never send the multi-megabyte snapshot
+      // payload through the pooler just to render the admin status panel.
+      const rows = await db.select({
+        label: backups.label,
+        createdAt: backups.createdAt,
+        byteSize: sql<number>`octet_length(${backups.data})`,
+        counts: sql<Record<string, number>>`case when ${backups.label} = 'images'
+          then jsonb_build_object('productImages', coalesce(jsonb_array_length((${backups.data})::jsonb -> 'productImages'), 0))
+          else jsonb_build_object(
+            'users', coalesce(jsonb_array_length((${backups.data})::jsonb -> 'users'), 0),
+            'stores', coalesce(jsonb_array_length((${backups.data})::jsonb -> 'stores'), 0),
+            'products', coalesce(jsonb_array_length((${backups.data})::jsonb -> 'products'), 0),
+            'orders', coalesce(jsonb_array_length((${backups.data})::jsonb -> 'orders'), 0),
+            'withdrawals', coalesce(jsonb_array_length((${backups.data})::jsonb -> 'withdrawals'), 0)
+          ) end`,
+      }).from(backups);
       const result = rows.map(r => {
-        let counts: any = {};
-        try {
-          const d = JSON.parse(r.data);
-          if (r.label === "images") {
-            counts = { productImages: d.productImages?.length || 0 };
-          } else {
-            counts = {
-              users: d.users?.length || 0,
-              stores: d.stores?.length || 0,
-              products: d.products?.length || 0,
-              orders: d.orders?.length || 0,
-              withdrawals: d.withdrawals?.length || 0,
-            };
-          }
-        } catch {}
-        return { label: r.label, createdAt: r.createdAt, byteSize: Buffer.byteLength(r.data, "utf-8"), counts };
+        return { label: r.label, createdAt: r.createdAt, byteSize: r.byteSize, counts: r.counts };
       });
       // Sort: current, previous, images
       const order = ["current", "previous", "images"];
