@@ -161,6 +161,17 @@ export const rechargeHistory = pgTable("recharge_history", {
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
+export const adminActions = pgTable("admin_actions", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  actorId: varchar("actor_id").notNull().references(() => users.id),
+  action: text("action").notNull(),
+  targetId: varchar("target_id"),
+  targetUsername: text("target_username"),
+  targetEmail: text("target_email"),
+  details: text("details").notNull().default(""),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
 export const userDailyStats = pgTable("user_daily_stats", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
   userId: varchar("user_id").notNull().references(() => users.id),

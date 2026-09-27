@@ -3,7 +3,7 @@ import { eq, desc, and, or, sql } from "drizzle-orm";
 import pkg from "pg";
 const { Pool } = pkg;
 import {
-  users, stores, products, orders, targets, chatMessages, withdrawals, merchantNotices, passwordResetRequests, rechargeHistory, userDailyStats, siteSettings, bulkOrders, bulkOrderItems,
+  users, stores, products, orders, targets, chatMessages, withdrawals, merchantNotices, passwordResetRequests, rechargeHistory, adminActions, userDailyStats, siteSettings, bulkOrders, bulkOrderItems,
   type User, type InsertUser,
   type Store, type InsertStore,
   type Product, type InsertProduct,
@@ -54,9 +54,8 @@ function readPositiveInteger(value: string | undefined, fallback: number): numbe
 
 const pool = new Pool({
   ...supabasePoolConfig,
-  // Three connections are not enough when API queries and connect-pg-simple
-  // session reads share this pool. Keep the defaults conservative, but allow
-  // deployments to tune them without another code change.
+  // Supabase's transaction pooler has a shared server-side connection limit.
+  // Keep each instance small; backups no longer acquire 11 clients at once.
   max: readPositiveInteger(process.env.DB_POOL_MAX, isSupabasePooler ? 5 : 10),
   idleTimeoutMillis: readPositiveInteger(process.env.DB_IDLE_TIMEOUT_MS, 30000),
   connectionTimeoutMillis: readPositiveInteger(process.env.DB_CONNECTION_TIMEOUT_MS, 15000),
@@ -141,6 +140,8 @@ export interface IStorage {
   updatePasswordResetRequestStatus(id: string, status: string): Promise<PasswordResetRequest | undefined>;
 
   createRechargeRecord(r: InsertRechargeHistory): Promise<RechargeHistory>;
+  updateUserWithRecharge(id: string, data: Partial<User>, recharge: Omit<InsertRechargeHistory, "previousBalance" | "newBalance" | "amount">): Promise<User | undefined>;
+  createAdminAction(action: { actorId: string; action: string; targetId?: string | null; targetUsername?: string | null; targetEmail?: string | null; details?: string }): Promise<void>;
   getAllRechargeHistory(): Promise<RechargeHistory[]>;
   getRechargeHistoryByUser(userId: string): Promise<RechargeHistory[]>;
 
@@ -190,6 +191,32 @@ export class DatabaseStorage implements IStorage {
   async updateUser(id: string, data: Partial<User>): Promise<User | undefined> {
     const [updated] = await db.update(users).set(data as any).where(eq(users.id, id)).returning();
     return updated;
+  }
+
+  async updateUserWithRecharge(
+    id: string,
+    data: Partial<User>,
+    recharge: Omit<InsertRechargeHistory, "previousBalance" | "newBalance" | "amount">,
+  ): Promise<User | undefined> {
+    return db.transaction(async (tx) => {
+      const [current] = await tx.select().from(users).where(eq(users.id, id)).for("update");
+      if (!current) return undefined;
+      const previousBalance = current.balance;
+      const [updated] = await tx.update(users).set(data as any).where(eq(users.id, id)).returning();
+      if (!updated) return undefined;
+      const newBalance = updated.balance;
+      const amount = (Number(newBalance) - Number(previousBalance)).toFixed(2);
+      if (amount !== "0.00") {
+        await tx.insert(rechargeHistory).values({
+          ...recharge,
+          userId: id,
+          amount,
+          previousBalance,
+          newBalance,
+        });
+      }
+      return updated;
+    });
   }
 
   async getAdminUser(): Promise<User | undefined> {
@@ -459,6 +486,17 @@ export class DatabaseStorage implements IStorage {
   async createRechargeRecord(r: InsertRechargeHistory): Promise<RechargeHistory> {
     const [created] = await db.insert(rechargeHistory).values(r).returning();
     return created;
+  }
+
+  async createAdminAction(action: {
+    actorId: string;
+    action: string;
+    targetId?: string | null;
+    targetUsername?: string | null;
+    targetEmail?: string | null;
+    details?: string;
+  }): Promise<void> {
+    await db.insert(adminActions).values(action);
   }
 
   async getAllRechargeHistory(): Promise<RechargeHistory[]> {

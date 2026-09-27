@@ -288,6 +288,8 @@ function scheduleImageBackup(delaySec = 10) {
   if (_imageBackupTimer) clearTimeout(_imageBackupTimer);
   _imageBackupTimer = setTimeout(async () => {
     _imageBackupTimer = null;
+    if (_backupInProgress) return scheduleImageBackup(10);
+    _backupInProgress = true;
     try {
       const allImages = await db.select().from(productImages);
       const payload = JSON.stringify({
@@ -296,7 +298,7 @@ function scheduleImageBackup(delaySec = 10) {
         productImages: allImages,
       });
       // Upsert label='images' (no rotation needed — always keep the latest)
-      const existing = await db.select().from(backups).where(eq(backups.label, "images"));
+      const existing = await db.select({ id: backups.id }).from(backups).where(eq(backups.label, "images")).limit(1);
       if (existing.length > 0) {
         await db.update(backups).set({ data: payload, createdAt: new Date() }).where(eq(backups.label, "images"));
       } else {
@@ -305,6 +307,8 @@ function scheduleImageBackup(delaySec = 10) {
       console.log(`[backup] Supabase image backup updated — ${allImages.length} images`);
     } catch (err) {
       console.error("[backup] Image backup failed:", err);
+    } finally {
+      _backupInProgress = false;
     }
   }, delaySec * 1000);
 }
@@ -779,13 +783,15 @@ ${pages.map(p => `  <url>
   // Auto-heal: if products exist but their images are missing, restore from Supabase image backup
   setTimeout(() => autoHealImages(), 3000);
 
-  // Take an initial Supabase image backup shortly after startup to ensure it's always current
-  scheduleImageBackup(15);
-
-  // Health check endpoint for uptime monitoring
-  app.get("/api/health", (_req, res) => {
-    res.json({ status: "ok", timestamp: new Date().toISOString(), uptime: process.uptime() });
-  });
+  // Rebuild only if missing or stale. This avoids copying every image on
+  // every restart, while recovering changes made just before a crash.
+  db.select({ createdAt: backups.createdAt }).from(backups).where(eq(backups.label, "images")).limit(1)
+    .then(async rows => {
+      if (rows.length === 0) return scheduleImageBackup(15);
+      const [latest] = await db.select({ createdAt: sql<Date | null>`max(${productImages.createdAt})` }).from(productImages);
+      if (latest.createdAt && new Date(latest.createdAt) > rows[0].createdAt) scheduleImageBackup(15);
+    })
+    .catch(err => console.error("[backup] Image backup check failed:", err));
 
   // Auth routes
   app.post("/api/auth/register", async (req, res) => {
@@ -2482,24 +2488,113 @@ Leave any image cell blank if no photo exists for that slot.
     for (const field of allowedFields) {
       if (req.body[field] !== undefined) updateData[field] = req.body[field];
     }
-    if (updateData.balance !== undefined) {
-      const previousBalance = user.balance;
-      const newBalance = updateData.balance;
-      const amount = (parseFloat(newBalance) - parseFloat(previousBalance as string)).toFixed(2);
-      await storage.createRechargeRecord({
-        userId: req.params.id,
-        amount,
-        previousBalance: previousBalance as string,
-        newBalance,
-        rechargedBy: (req.user as any).id,
-        note: req.body.rechargeNote || "Balance update by admin",
+    const balanceChanged = updateData.balance !== undefined;
+    if (balanceChanged) {
+      const value = String(updateData.balance).trim();
+      if (!/^\d+(?:\.\d{1,2})?$/.test(value) || !Number.isFinite(Number(value)) || Number(value) > 9999999999.99) {
+        return res.status(400).json({ message: "Balance must be a non-negative amount with at most two decimal places" });
+      }
+      updateData.balance = Number(value).toFixed(2);
+    }
+    const updated = balanceChanged
+      ? await storage.updateUserWithRecharge(req.params.id, updateData, {
+          userId: req.params.id,
+          rechargedBy: (req.user as any).id,
+          note: typeof req.body.rechargeNote === "string" ? req.body.rechargeNote.slice(0, 500) : "Balance update by admin",
+        } as any)
+      : await storage.updateUser(req.params.id, updateData);
+    if (!updated) return res.status(404).json({ message: "User not found" });
+    const changedFields = Object.keys(updateData).filter(field => field !== "balance");
+    if (changedFields.length) {
+      await storage.createAdminAction({
+        actorId: (req.user as any).id,
+        action: "user_update",
+        targetId: user.id,
+        targetUsername: user.username,
+        targetEmail: user.email,
+        details: `Updated fields: ${changedFields.join(", ")}`,
       });
     }
-    const updated = await storage.updateUser(req.params.id, updateData);
-    if (!updated) return res.status(404).json({ message: "User not found" });
     notifyDataSync("users", "update", req.params.id);
     const { password, ...safeUser } = updated;
     res.json(safeUser);
+  });
+
+  app.get("/api/admin/reference-search", isAuthenticated, isAdmin, async (req, res) => {
+    const requester = req.user as any;
+    const requestedCode = typeof req.query.code === "string" ? req.query.code.trim() : "";
+    if (!requestedCode) return res.status(400).json({ message: "A reference code is required" });
+    const ownCode = String(requester.referenceCode || "").trim();
+    if (requester.role !== "superadmin" && requestedCode.toLowerCase() !== ownCode.toLowerCase()) {
+      return res.status(403).json({ message: "You can only search using your own reference code" });
+    }
+    const code = requester.role === "superadmin" ? requestedCode : ownCode;
+    if (!code) return res.status(400).json({ message: "A reference code is required" });
+    const normalizedCode = code.toLowerCase();
+    const [administrator] = await db.select({
+      id: users.id,
+      username: users.username,
+      email: users.email,
+      referenceCode: users.referenceCode,
+      role: users.role,
+    }).from(users).where(and(
+      sql`lower(trim(${users.referenceCode})) = ${normalizedCode}`,
+      inArray(users.role, ["admin", "superadmin"]),
+    )).limit(1);
+    if (!administrator) return res.status(404).json({ message: "Administrator reference code not found" });
+    const rows = await db.select({
+      id: users.id,
+      username: users.username,
+      email: users.email,
+      phone: users.phone,
+      storeId: stores.id,
+      storeName: stores.name,
+      storeReferenceCode: stores.referenceCode,
+      isApproved: stores.isApproved,
+    }).from(stores)
+      .innerJoin(users, eq(stores.ownerId, users.id))
+      .where(sql`lower(trim(${stores.referenceCode})) = ${normalizedCode}`);
+    res.json({
+      administrator,
+      customers: rows,
+    });
+  });
+
+  app.get("/api/admin/actions", isAuthenticated, isSuperAdmin, async (req, res) => {
+    const rawLimit = typeof req.query.limit === "string" ? Number(req.query.limit) : 100;
+    if (!Number.isInteger(rawLimit) || rawLimit < 1) return res.status(400).json({ message: "limit must be a positive integer" });
+    const limit = Math.min(rawLimit, 500);
+    const adminId = typeof req.query.adminId === "string" && req.query.adminId.trim() ? req.query.adminId.trim() : null;
+    const result = await pool.query(`
+      SELECT id, actor_id AS "actorId", actor_username AS "actorUsername", actor_email AS "actorEmail",
+             action, target_id AS "targetId", target_username AS "targetUsername", target_email AS "targetEmail",
+             details, created_at AS "createdAt"
+      FROM (
+        SELECT a.id, a.actor_id, actor.username AS actor_username, actor.email AS actor_email,
+               a.action, a.target_id,
+               COALESCE(a.target_username, target.username) AS target_username,
+               COALESCE(a.target_email, target.email) AS target_email,
+               a.details, a.created_at
+        FROM admin_actions a
+        LEFT JOIN users actor ON actor.id = a.actor_id
+        LEFT JOIN users target ON target.id = a.target_id
+        WHERE ($1::varchar IS NULL OR a.actor_id = $1)
+        UNION ALL
+        SELECT r.id, r.recharged_by AS actor_id, actor.username AS actor_username, actor.email AS actor_email,
+               'balance_update' AS action, r.user_id AS target_id,
+               target.username AS target_username, target.email AS target_email,
+               json_build_object('amount', r.amount, 'previousBalance', r.previous_balance,
+                 'newBalance', r.new_balance, 'note', r.note)::text AS details,
+               r.created_at
+        FROM recharge_history r
+        LEFT JOIN users actor ON actor.id = r.recharged_by
+        LEFT JOIN users target ON target.id = r.user_id
+        WHERE ($1::varchar IS NULL OR r.recharged_by = $1)
+      ) activity
+      ORDER BY created_at DESC
+      LIMIT $2
+    `, [adminId, limit]);
+    res.json(result.rows);
   });
 
   app.patch("/api/users/:id/password", isAuthenticated, isAdmin, async (req, res) => {
@@ -3034,6 +3129,9 @@ Leave any image cell blank if no photo exists for that slot.
   });
 
   app.patch("/api/stores/:id/approve", isAuthenticated, isAdmin, async (req, res) => {
+    if ((req.user as any)?.role !== "superadmin") {
+      return res.status(403).json({ message: "Please contact a super administrator to approve this store. Only super administrators can approve stores." });
+    }
     const store = await storage.getStore(req.params.id);
     if (!store) return res.status(404).json({ message: "Store not found" });
     const linkedIds = await getLinkedUserIds(req);
@@ -3041,6 +3139,15 @@ Leave any image cell blank if no photo exists for that slot.
       return res.status(403).json({ message: "You can only manage your own linked customers' stores" });
     }
     const updated = await storage.updateStore(req.params.id, { isApproved: true } as any);
+    const owner = await storage.getUser(store.ownerId);
+    await storage.createAdminAction({
+      actorId: (req.user as any).id,
+      action: "store_approved",
+      targetId: store.id,
+      targetUsername: owner?.username || null,
+      targetEmail: owner?.email || null,
+      details: `Approved store: ${store.name}`,
+    });
     await storage.createNotice({
       storeId: store.id,
       userId: store.ownerId,
@@ -3060,6 +3167,15 @@ Leave any image cell blank if no photo exists for that slot.
       return res.status(403).json({ message: "You can only manage your own linked customers' stores" });
     }
     await storage.deleteStore(req.params.id);
+    const owner = await storage.getUser(store.ownerId);
+    await storage.createAdminAction({
+      actorId: (req.user as any).id,
+      action: "store_rejected",
+      targetId: store.id,
+      targetUsername: owner?.username || null,
+      targetEmail: owner?.email || null,
+      details: `Rejected store: ${store.name}`,
+    });
     await storage.createNotice({
       userId: store.ownerId,
       type: "warning",
@@ -3268,9 +3384,13 @@ Leave any image cell blank if no photo exists for that slot.
   // all listening instances receive it and broadcast to their WS clients.
   let listenClient: InstanceType<typeof PgClient> | null = null;
   (function setupPgListen() {
+    const listenHost = process.env.SUPA_HOST;
+    const listenPort = listenHost?.includes("pooler.supabase.com")
+      ? 5432
+      : parseInt(process.env.SUPA_PORT || "5432");
     listenClient = new PgClient(
-      process.env.SUPA_HOST
-        ? { host: process.env.SUPA_HOST, user: process.env.SUPA_USER, password: process.env.SUPA_PASS, database: process.env.SUPA_DB || "postgres", port: parseInt(process.env.SUPA_PORT || "5432"), ssl: { rejectUnauthorized: false } }
+      listenHost
+        ? { host: listenHost, user: process.env.SUPA_USER, password: process.env.SUPA_PASS, database: process.env.SUPA_DB || "postgres", port: listenPort, ssl: { rejectUnauthorized: false } }
         : { connectionString: process.env.DATABASE_URL }
     );
     listenClient.connect().then(() => {
