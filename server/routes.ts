@@ -754,6 +754,31 @@ ${pages.map(p => `  <url>
     }
   });
 
+  // Record successful administrator writes without copying request bodies:
+  // they may contain passwords, identity images, or payment details. Balance
+  // changes and store decisions have richer dedicated records below.
+  app.use("/api", (req, res, next) => {
+    if (!["POST", "PUT", "PATCH", "DELETE"].includes(req.method)) return next();
+    const route = `/api${req.path}`;
+    if (/^\/api\/(auth\/|upload(?:\/|$))/.test(route)
+      || (req.method === "PATCH" && /^\/api\/users\/[^/]+$/.test(route))
+      || (req.method === "PATCH" && /^\/api\/stores\/[^/]+\/(approve|reject)$/.test(route))) return next();
+    res.once("finish", () => {
+      if (res.statusCode < 200 || res.statusCode >= 300) return;
+      const actor = req.user as any;
+      if (actor?.role !== "admin" && actor?.role !== "superadmin") return;
+      const routePattern = route.replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, ":id");
+      const targetId = route.match(/[0-9a-f]{8}-[0-9a-f-]{27,}/i)?.[0] ?? null;
+      storage.createAdminAction({
+        actorId: actor.id,
+        action: `${req.method} ${routePattern}`,
+        targetId,
+        details: JSON.stringify({ path: route, status: res.statusCode }),
+      }).catch(err => console.error("[audit] Failed to record admin action:", err));
+    });
+    next();
+  });
+
   // Serve uploaded files (legacy support for existing file-based images)
   const express = await import("express");
   app.use("/uploads", express.default.static("uploads"));
