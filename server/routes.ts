@@ -2531,7 +2531,7 @@ Leave any image cell blank if no photo exists for that slot.
     const code = requester.role === "superadmin" ? requestedCode : ownCode;
     if (!code) return res.status(400).json({ message: "A reference code is required" });
     const normalizedCode = code.toLowerCase();
-    const [administrator] = await db.select({
+    const [activeAdministrator] = await db.select({
       id: users.id,
       username: users.username,
       email: users.email,
@@ -2541,6 +2541,22 @@ Leave any image cell blank if no photo exists for that slot.
       sql`lower(trim(${users.referenceCode})) = ${normalizedCode}`,
       inArray(users.role, ["admin", "superadmin"]),
     )).limit(1);
+    // A removed admin loses their reference code, but existing stores retain
+    // the code used at registration and the customer's original referral.
+    let administrator: typeof activeAdministrator | undefined = activeAdministrator;
+    if (!administrator && requester.role === "superadmin") {
+      const historical = await pool.query<NonNullable<typeof activeAdministrator>>(
+        `SELECT referrer.id, referrer.username, referrer.email,
+                registered.reference_code AS "referenceCode", referrer.role
+         FROM stores registered
+         JOIN users customer ON customer.id = registered.owner_id
+         JOIN users referrer ON referrer.id = customer.referred_by
+         WHERE lower(trim(registered.reference_code)) = $1
+         LIMIT 1`,
+        [normalizedCode],
+      );
+      administrator = historical.rows[0];
+    }
     if (!administrator) return res.status(404).json({ message: "Administrator reference code not found" });
     const rows = await db.select({
       id: users.id,
