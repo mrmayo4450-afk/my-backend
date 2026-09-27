@@ -140,8 +140,14 @@ export interface IStorage {
   updatePasswordResetRequestStatus(id: string, status: string): Promise<PasswordResetRequest | undefined>;
 
   createRechargeRecord(r: InsertRechargeHistory): Promise<RechargeHistory>;
-  updateUserWithRecharge(id: string, data: Partial<User>, recharge: Omit<InsertRechargeHistory, "previousBalance" | "newBalance" | "amount">): Promise<User | undefined>;
-  createAdminAction(action: { actorId: string; action: string; targetId?: string | null; targetUsername?: string | null; targetEmail?: string | null; details?: string }): Promise<void>;
+  createAdminAction(action: {
+    actorId: string;
+    action: string;
+    targetId?: string | null;
+    targetUsername?: string | null;
+    targetEmail?: string | null;
+    details?: string;
+  }): Promise<void>;
   getAllRechargeHistory(): Promise<RechargeHistory[]>;
   getRechargeHistoryByUser(userId: string): Promise<RechargeHistory[]>;
 
@@ -191,32 +197,6 @@ export class DatabaseStorage implements IStorage {
   async updateUser(id: string, data: Partial<User>): Promise<User | undefined> {
     const [updated] = await db.update(users).set(data as any).where(eq(users.id, id)).returning();
     return updated;
-  }
-
-  async updateUserWithRecharge(
-    id: string,
-    data: Partial<User>,
-    recharge: Omit<InsertRechargeHistory, "previousBalance" | "newBalance" | "amount">,
-  ): Promise<User | undefined> {
-    return db.transaction(async (tx) => {
-      const [current] = await tx.select().from(users).where(eq(users.id, id)).for("update");
-      if (!current) return undefined;
-      const previousBalance = current.balance;
-      const [updated] = await tx.update(users).set(data as any).where(eq(users.id, id)).returning();
-      if (!updated) return undefined;
-      const newBalance = updated.balance;
-      const amount = (Number(newBalance) - Number(previousBalance)).toFixed(2);
-      if (amount !== "0.00") {
-        await tx.insert(rechargeHistory).values({
-          ...recharge,
-          userId: id,
-          amount,
-          previousBalance,
-          newBalance,
-        });
-      }
-      return updated;
-    });
   }
 
   async getAdminUser(): Promise<User | undefined> {

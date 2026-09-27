@@ -1,5 +1,5 @@
 import type { Express, Request, Response } from "express";
-import { createServer, type Server } from "http";
+import { createServer, ServerResponse, type Server } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import session from "express-session";
 import connectPgSimple from "connect-pg-simple";
@@ -14,6 +14,9 @@ import fs from "fs";
 import AdmZip from "adm-zip";
 import archiver from "archiver";
 import { storage, db, pool } from "./storage";
+import { hashPassword, verifyPassword } from "./password-security";
+import { permanentlyDeleteMerchant } from "./delete-merchant";
+import { acceptBulkOrder, adminUpdateUserFinance, cancelPendingOrder, completeOrder, createDirectPurchase, expireBulkOrderIfPending, pickupAllOrders, pickupOrder, updateBulkOrder, updateWithdrawalStatusFinancial } from "./financial-orders";
 import { insertUserSchema, insertStoreSchema, insertProductSchema, insertOrderSchema, insertTargetSchema, insertWithdrawalSchema, insertNoticeSchema } from "@shared/schema";
 import { users, products, stores, orders, targets, chatMessages, withdrawals, merchantNotices, rechargeHistory, userDailyStats, productImages, backups, siteSettings, bulkOrders, bulkOrderItems } from "@shared/schema";
 import { eq, sql, inArray, and, desc, getTableColumns } from "drizzle-orm";
@@ -52,18 +55,18 @@ async function runDatabaseBackup() {
     if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
 
     // Metadata only — images are backed up separately to Supabase via scheduleImageBackup()
-    const [allUsers, allStores, allProducts, allOrders, allTargets, allMessages, allWithdrawals, allNotices, allRecharge, allDailyStats] = await Promise.all([
-      db.select().from(users),
-      db.select().from(stores),
-      db.select().from(products),
-      db.select().from(orders),
-      db.select().from(targets),
-      db.select().from(chatMessages),
-      db.select().from(withdrawals),
-      db.select().from(merchantNotices),
-      db.select().from(rechargeHistory),
-      db.select().from(userDailyStats),
-    ]);
+    const allUsers = await db.select().from(users);
+    const allStores = await db.select().from(stores);
+    const allProducts = await db.select().from(products);
+    const allOrders = await db.select().from(orders);
+    const allBulkOrders = await db.select().from(bulkOrders);
+    const allBulkOrderItems = await db.select().from(bulkOrderItems);
+    const allTargets = await db.select().from(targets);
+    const allMessages = await db.select().from(chatMessages);
+    const allWithdrawals = await db.select().from(withdrawals);
+    const allNotices = await db.select().from(merchantNotices);
+    const allRecharge = await db.select().from(rechargeHistory);
+    const allDailyStats = await db.select().from(userDailyStats);
 
     const backupData = {
       timestamp: new Date().toISOString(),
@@ -72,6 +75,8 @@ async function runDatabaseBackup() {
       stores: allStores,
       products: allProducts,
       orders: allOrders,
+      bulkOrders: allBulkOrders,
+      bulkOrderItems: allBulkOrderItems,
       targets: allTargets,
       chatMessages: allMessages,
       withdrawals: allWithdrawals,
@@ -101,6 +106,7 @@ async function runDatabaseBackup() {
 }
 
 async function restoreFromBackup(backupFile: string): Promise<{ success: boolean; message: string; counts: any }> {
+  const counts: any = {};
   try {
     if (!fs.existsSync(backupFile)) {
       return { success: false, message: "Backup file not found", counts: {} };
@@ -108,36 +114,37 @@ async function restoreFromBackup(backupFile: string): Promise<{ success: boolean
 
     const raw = fs.readFileSync(backupFile, "utf-8");
     const data = JSON.parse(raw);
-    const counts: any = {};
+    await db.transaction(async tx => {
+      const upsertRows = async (table: any, rows: any[], tableName: string) => {
+        if (!rows || rows.length === 0) { counts[tableName] = 0; return; }
+        let completed = 0;
+        for (const row of rows) {
+          await tx.insert(table).values(row).onConflictDoUpdate({ target: table.id, set: row });
+          counts[tableName] = ++completed;
+        }
+      };
 
-    const upsertRows = async (table: any, rows: any[], tableName: string) => {
-      if (!rows || rows.length === 0) { counts[tableName] = 0; return; }
-      for (const row of rows) {
-        try {
-          await db.insert(table).values(row).onConflictDoUpdate({ target: table.id, set: row });
-        } catch (_) {}
-      }
-      counts[tableName] = rows.length;
-    };
-
-    if (data.users?.length) await upsertRows(users, data.users, "users");
-    if (data.stores?.length) await upsertRows(stores, data.stores, "stores");
-    if (data.products?.length) await upsertRows(products, data.products, "products");
-    if (data.orders?.length) await upsertRows(orders, data.orders, "orders");
-    if (data.targets?.length) await upsertRows(targets, data.targets, "targets");
-    if (data.chatMessages?.length) await upsertRows(chatMessages, data.chatMessages, "chatMessages");
-    if (data.withdrawals?.length) await upsertRows(withdrawals, data.withdrawals, "withdrawals");
-    if (data.merchantNotices?.length) await upsertRows(merchantNotices, data.merchantNotices, "merchantNotices");
-    if (data.rechargeHistory?.length) await upsertRows(rechargeHistory, data.rechargeHistory, "rechargeHistory");
-    if (data.userDailyStats?.length) await upsertRows(userDailyStats, data.userDailyStats, "userDailyStats");
-    // Restore product images — most critical for store integrity
-    if (data.productImages?.length) await upsertRows(productImages, data.productImages, "productImages");
+      if (data.users?.length) await upsertRows(users, data.users, "users");
+      if (data.stores?.length) await upsertRows(stores, data.stores, "stores");
+      if (data.products?.length) await upsertRows(products, data.products, "products");
+      if (data.orders?.length) await upsertRows(orders, data.orders, "orders");
+      if (data.bulkOrders?.length) await upsertRows(bulkOrders, data.bulkOrders, "bulkOrders");
+      if (data.bulkOrderItems?.length) await upsertRows(bulkOrderItems, data.bulkOrderItems, "bulkOrderItems");
+      if (data.targets?.length) await upsertRows(targets, data.targets, "targets");
+      if (data.chatMessages?.length) await upsertRows(chatMessages, data.chatMessages, "chatMessages");
+      if (data.withdrawals?.length) await upsertRows(withdrawals, data.withdrawals, "withdrawals");
+      if (data.merchantNotices?.length) await upsertRows(merchantNotices, data.merchantNotices, "merchantNotices");
+      if (data.rechargeHistory?.length) await upsertRows(rechargeHistory, data.rechargeHistory, "rechargeHistory");
+      if (data.userDailyStats?.length) await upsertRows(userDailyStats, data.userDailyStats, "userDailyStats");
+      // Restore product images — most critical for store integrity
+      if (data.productImages?.length) await upsertRows(productImages, data.productImages, "productImages");
+    });
 
     console.log(`[restore] Restore completed from ${backupFile}:`, counts);
     return { success: true, message: `Restore completed from backup dated ${data.timestamp}`, counts };
   } catch (err: any) {
     console.error("[restore] Restore failed:", err);
-    return { success: false, message: err.message || "Restore failed", counts: {} };
+    return { success: false, message: `Restore failed and was rolled back: ${err.message || "Unknown error"}`, counts };
   }
 }
 
@@ -165,27 +172,37 @@ async function runPeriodicSync() {
     const raw = fs.readFileSync(backupFile, "utf-8");
     const data = JSON.parse(raw);
 
-    const [dbUsers, dbStores, dbProducts, dbOrders, dbWithdrawals, dbProductImages] = await Promise.all([
-      db.select({ id: users.id }).from(users),
-      db.select({ id: stores.id }).from(stores),
-      db.select({ id: products.id }).from(products),
-      db.select({ id: orders.id }).from(orders),
-      db.select({ id: withdrawals.id }).from(withdrawals),
-      db.select({ id: productImages.id }).from(productImages),
-    ]);
+    const dbUsers = await db.select({ id: users.id }).from(users);
+    const dbStores = await db.select({ id: stores.id }).from(stores);
+    const dbProducts = await db.select({ id: products.id }).from(products);
+    const dbOrders = await db.select({ id: orders.id }).from(orders);
+    const dbBulkOrders = await db.select({ id: bulkOrders.id }).from(bulkOrders);
+    const dbBulkItems = await db.select({ id: bulkOrderItems.id }).from(bulkOrderItems);
+    const dbWithdrawals = await db.select({ id: withdrawals.id }).from(withdrawals);
+    const dbRecharge = await db.select({ id: rechargeHistory.id }).from(rechargeHistory);
+    const dbStats = await db.select({ id: userDailyStats.id }).from(userDailyStats);
+    const dbProductImages = await db.select({ id: productImages.id }).from(productImages);
 
     const dbUserIds = new Set(dbUsers.map(r => r.id));
     const dbStoreIds = new Set(dbStores.map(r => r.id));
     const dbProductIds = new Set(dbProducts.map(r => r.id));
     const dbOrderIds = new Set(dbOrders.map(r => r.id));
+    const dbBulkOrderIds = new Set(dbBulkOrders.map(r => r.id));
+    const dbBulkItemIds = new Set(dbBulkItems.map(r => r.id));
     const dbWithdrawalIds = new Set(dbWithdrawals.map(r => r.id));
+    const dbRechargeIds = new Set(dbRecharge.map(r => r.id));
+    const dbStatsIds = new Set(dbStats.map(r => r.id));
     const dbImageIds = new Set(dbProductImages.map(r => r.id));
 
     const missingUsers = (data.users || []).filter((r: any) => !dbUserIds.has(r.id));
     const missingStores = (data.stores || []).filter((r: any) => !dbStoreIds.has(r.id));
     const missingProducts = (data.products || []).filter((r: any) => !dbProductIds.has(r.id));
     const missingOrders = (data.orders || []).filter((r: any) => !dbOrderIds.has(r.id));
+    const missingBulkOrders = (data.bulkOrders || []).filter((r: any) => !dbBulkOrderIds.has(r.id));
+    const missingBulkItems = (data.bulkOrderItems || []).filter((r: any) => !dbBulkItemIds.has(r.id));
     const missingWithdrawals = (data.withdrawals || []).filter((r: any) => !dbWithdrawalIds.has(r.id));
+    const missingRecharge = (data.rechargeHistory || []).filter((r: any) => !dbRechargeIds.has(r.id));
+    const missingStats = (data.userDailyStats || []).filter((r: any) => !dbStatsIds.has(r.id));
     // Only restore images whose product still exists in DB (to avoid FK violations)
     const missingImages = (data.productImages || []).filter((r: any) => !dbImageIds.has(r.id) && dbProductIds.has(r.productId));
 
@@ -200,7 +217,11 @@ async function runPeriodicSync() {
     if (missingStores.length) await insertMissing(stores, missingStores);
     if (missingProducts.length) await insertMissing(products, missingProducts);
     if (missingOrders.length) await insertMissing(orders, missingOrders);
+    if (missingBulkOrders.length) await insertMissing(bulkOrders, missingBulkOrders);
+    if (missingBulkItems.length) await insertMissing(bulkOrderItems, missingBulkItems);
     if (missingWithdrawals.length) await insertMissing(withdrawals, missingWithdrawals);
+    if (missingRecharge.length) await insertMissing(rechargeHistory, missingRecharge);
+    if (missingStats.length) await insertMissing(userDailyStats, missingStats);
     if (missingImages.length) await insertMissing(productImages, missingImages);
 
     if (synced > 0) {
@@ -243,6 +264,8 @@ function scheduleBackup(delaySec = 5) {
       const dbStores = await db.select().from(stores);
       const dbProducts = await db.select().from(products);
       const dbOrders = await db.select().from(orders);
+      const dbBulkOrders = await db.select().from(bulkOrders);
+      const dbBulkOrderItems = await db.select().from(bulkOrderItems);
       const dbTargets = await db.select().from(targets);
       const dbWithdrawals = await db.select().from(withdrawals);
       const dbChats = await db.select().from(chatMessages);
@@ -254,19 +277,22 @@ function scheduleBackup(delaySec = 5) {
         timestamp: new Date().toISOString(),
         version: 3,
         users: dbUsers, stores: dbStores, products: dbProducts,
-        orders: dbOrders, targets: dbTargets, withdrawals: dbWithdrawals,
+        orders: dbOrders, bulkOrders: dbBulkOrders, bulkOrderItems: dbBulkOrderItems,
+        targets: dbTargets, withdrawals: dbWithdrawals,
         chatMessages: dbChats, merchantNotices: dbNotices,
         rechargeHistory: dbRecharge, userDailyStats: dbStats,
         siteSettings: dbSettings,
       });
       // Rotate: delete old 'previous', promote 'current' → 'previous', insert new 'current'
-      const metaRows = await db.select({ id: backups.id, label: backups.label })
-        .from(backups).where(sql`label IN ('current','previous')`);
-      const prev = metaRows.find(r => r.label === "previous");
-      const curr = metaRows.find(r => r.label === "current");
-      if (prev) await db.delete(backups).where(eq(backups.id, prev.id));
-      if (curr) await db.update(backups).set({ label: "previous" }).where(eq(backups.id, curr.id));
-      await db.insert(backups).values({ label: "current", data: payload });
+      await db.transaction(async tx => {
+        const metaRows = await tx.select({ id: backups.id, label: backups.label })
+          .from(backups).where(sql`label IN ('current','previous')`);
+        const prev = metaRows.find(r => r.label === "previous");
+        const curr = metaRows.find(r => r.label === "current");
+        if (prev) await tx.delete(backups).where(eq(backups.id, prev.id));
+        if (curr) await tx.update(backups).set({ label: "previous" }).where(eq(backups.id, curr.id));
+        await tx.insert(backups).values({ label: "current", data: payload });
+      });
       console.log(`[backup] Supabase metadata backup updated — products: ${dbProducts.length}, orders: ${dbOrders.length}`);
     } catch (err) {
       console.error("[backup] Metadata backup failed:", err);
@@ -432,19 +458,21 @@ async function migrateFileImagesToBase64() {
 
 const PgSession = connectPgSimple(session);
 
-function hashPassword(password: string): string {
-  return crypto.createHash("sha256").update(password + "marketplacesalt").digest("hex");
+function getJwtSecret(): string {
+  if (process.env.SESSION_SECRET) return process.env.SESSION_SECRET;
+  if (process.env.NODE_ENV === "production" || process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID) {
+    throw new Error("SESSION_SECRET must be configured in production");
+  }
+  return "marketplace-development-secret";
 }
 
-const JWT_SECRET = process.env.SESSION_SECRET || "marketplace-secret-2024";
-
 function generateToken(userId: string): string {
-  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "7d" });
+  return jwt.sign({ userId }, getJwtSecret(), { expiresIn: "7d" });
 }
 
 function verifyToken(token: string): { userId: string } | null {
   try {
-    const payload = jwt.verify(token, JWT_SECRET) as any;
+    const payload = jwt.verify(token, getJwtSecret()) as any;
     return { userId: payload.userId };
   } catch {
     return null;
@@ -568,6 +596,14 @@ function isNotFrozen(req: Request, res: Response, next: any) {
 
 const clients = new Map<string, WebSocket>();
 
+function disconnectDeletedUser(userId: string) {
+  const socket = clients.get(userId);
+  if (socket) {
+    clients.delete(userId);
+    socket.close(1008, "Account deleted");
+  }
+}
+
 function broadcastAll(data: object) {
   const msg = JSON.stringify(data);
   for (const ws of clients.values()) {
@@ -592,6 +628,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   const isProduction = process.env.NODE_ENV === "production"
     || !!process.env.RAILWAY_ENVIRONMENT
     || !!process.env.RAILWAY_PROJECT_ID;
+  if (isProduction && !process.env.SESSION_SECRET) {
+    throw new Error("SESSION_SECRET must be configured in production");
+  }
 
   // Note: DB connections are managed exclusively by the shared pool in storage.ts.
 
@@ -599,18 +638,24 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     app.set("trust proxy", 1);
   }
 
-  // Multi-domain CORS: dynamically reflect any incoming origin so all connected
-  // custom domains can make credentialed requests (login sessions, cookies, etc.)
-  app.use(cors({
-    origin: (origin, callback) => {
-      // Allow same-origin requests (no Origin header) and any external origin
-      callback(null, origin || true);
-    },
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
-    exposedHeaders: ["Set-Cookie"],
-    maxAge: 86400,
+  const allowedOrigins = new Set([
+    "https://www.lernnest.xyz",
+    "https://lernnest.xyz",
+    ...(process.env.CORS_ALLOWED_ORIGINS || "").split(",").map(origin => origin.trim()).filter(Boolean),
+  ]);
+  const isSameOrigin = (origin: string, req: Request) =>
+    origin === `${req.protocol}://${req.get("host")}`;
+  const originAllowed = (origin: string | undefined, req: Request) =>
+    !!origin && (allowedOrigins.has(origin) || isSameOrigin(origin, req));
+  app.use(cors((req, callback) => {
+    const origin = req.header("Origin");
+    callback(null, {
+      origin: origin && originAllowed(origin, req) ? origin : false,
+      credentials: true,
+      methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+      maxAge: 86400,
+    });
   }));
 
   app.use((_req, res, next) => {
@@ -641,8 +686,30 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // Simple in-memory rate limiter for login — prevents brute-force and Cloudflare WAF triggers
   const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+  const publicRequestAttempts = new Map<string, { count: number; resetAt: number }>();
+  function publicRateLimit(bucket: string, maxAttempts: number, windowMs: number) {
+    return (req: Request, res: Response, next: any) => {
+      const ip = req.ip || req.socket.remoteAddress || "unknown";
+      const key = `${bucket}:${ip}`;
+      const now = Date.now();
+      const entry = publicRequestAttempts.get(key);
+      if (!entry || now > entry.resetAt) {
+        publicRequestAttempts.set(key, { count: 1, resetAt: now + windowMs });
+        return next();
+      }
+      entry.count++;
+      if (entry.count > maxAttempts) {
+        res.setHeader("Retry-After", String(Math.ceil((entry.resetAt - now) / 1000)));
+        return res.status(429).json({ message: "Too many requests. Please try again later." });
+      }
+      next();
+    };
+  }
+  const uploadRateLimit = publicRateLimit("upload", 40, 15 * 60 * 1000);
+  const registerRateLimit = publicRateLimit("register", 8, 60 * 60 * 1000);
+  const forgotPasswordRateLimit = publicRateLimit("forgot-password", 5, 15 * 60 * 1000);
   function loginRateLimit(req: Request, res: Response, next: any) {
-    const ip = (req.headers["x-forwarded-for"] as string || req.socket.remoteAddress || "unknown").split(",")[0].trim();
+    const ip = req.ip || req.socket.remoteAddress || "unknown";
     const now = Date.now();
     const windowMs = 15 * 60 * 1000; // 15-minute window
     const maxAttempts = 15;
@@ -663,6 +730,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const now = Date.now();
     for (const [ip, entry] of loginAttempts) {
       if (now > entry.resetAt) loginAttempts.delete(ip);
+    }
+    for (const [key, entry] of publicRequestAttempts) {
+      if (now > entry.resetAt) publicRequestAttempts.delete(key);
     }
   }, 5 * 60 * 1000);
 
@@ -716,9 +786,9 @@ ${pages.map(p => `  <url>
     }
   });
 
-  app.use(session({
+  const sessionMiddleware = session({
     store: new PgSession({ pool, createTableIfMissing: true }),
-    secret: process.env.SESSION_SECRET || "marketplace-secret-2024",
+    secret: process.env.SESSION_SECRET || "marketplace-development-secret",
     resave: false,
     saveUninitialized: false,
     name: "mkt.sid",
@@ -728,16 +798,42 @@ ${pages.map(p => `  <url>
       sameSite: isProduction ? "none" : "lax",
       maxAge: 7 * 24 * 60 * 60 * 1000,
     },
-  }));
+  });
+  app.use(sessionMiddleware);
 
   app.use(passport.initialize());
   app.use(passport.session());
+  app.use((req, res, next) => {
+    if (!["GET", "HEAD", "OPTIONS"].includes(req.method) && req.isAuthenticated()) {
+      const origin = req.header("Origin");
+      if (!origin || !originAllowed(origin, req)) {
+        return res.status(403).json({ message: "Invalid or missing request origin" });
+      }
+    }
+    next();
+  });
 
   passport.use(new LocalStrategy({ usernameField: "email" }, async (email, password, done) => {
     try {
       const user = await storage.getUserByEmail(email);
       if (!user) return done(null, false, { message: "Invalid credentials" });
-      if (user.password !== hashPassword(password)) return done(null, false, { message: "Invalid credentials" });
+      const verification = await verifyPassword(password, user.password);
+      if (!verification.valid) return done(null, false, { message: "Invalid credentials" });
+      if (verification.needsUpgrade) {
+        const upgradedHash = await hashPassword(password);
+        const [upgraded] = await db.update(users).set({ password: upgradedHash })
+          .where(and(eq(users.id, user.id), eq(users.password, user.password)))
+          .returning({ id: users.id });
+        if (upgraded) {
+          user.password = upgradedHash;
+        } else {
+          const currentUser = await storage.getUser(user.id);
+          if (!currentUser || !(await verifyPassword(password, currentUser.password)).valid) {
+            return done(null, false, { message: "Invalid credentials" });
+          }
+          return done(null, currentUser);
+        }
+      }
       return done(null, user);
     } catch (err) {
       return done(err);
@@ -755,12 +851,15 @@ ${pages.map(p => `  <url>
   });
 
   // Record successful administrator writes without copying request bodies:
-  // they may contain passwords, identity images, or payment details. Balance
-  // changes and store decisions have richer dedicated records below.
+  // they may contain passwords, identity images, or payment details.
+  // Balance changes and store decisions have richer dedicated records below.
   app.use("/api", (req, res, next) => {
     if (!["POST", "PUT", "PATCH", "DELETE"].includes(req.method)) return next();
     const route = `/api${req.path}`;
     if (/^\/api\/(auth\/|upload(?:\/|$))/.test(route)
+      // A deletion must not recreate identifying audit history after the
+      // transaction has removed the account and its dependent records.
+      || (req.method === "DELETE" && /^\/api\/(?:admins|merchants|stores)\/[^/]+$/.test(route))
       || (req.method === "PATCH" && /^\/api\/users\/[^/]+$/.test(route))
       || (req.method === "PATCH" && /^\/api\/stores\/[^/]+\/(approve|reject)$/.test(route))) return next();
     res.once("finish", () => {
@@ -783,7 +882,7 @@ ${pages.map(p => `  <url>
   const express = await import("express");
   app.use("/uploads", express.default.static("uploads"));
 
-  app.post("/api/upload", isAuthenticated, isAdmin, upload.single("image"), (req: any, res) => {
+  app.post("/api/upload", isAuthenticated, isAdmin, uploadRateLimit, upload.single("image"), (req: any, res) => {
     if (!req.file) return res.status(400).json({ message: "No file uploaded or invalid file type" });
     const base64 = req.file.buffer.toString("base64");
     const mimeType = req.file.mimetype;
@@ -791,7 +890,7 @@ ${pages.map(p => `  <url>
     res.json({ imageUrl });
   });
 
-  app.post("/api/upload/nic", upload.single("image"), (req: any, res) => {
+  app.post("/api/upload/nic", uploadRateLimit, upload.single("image"), (req: any, res) => {
     if (!req.file) return res.status(400).json({ message: "No file uploaded or invalid file type" });
     const base64 = req.file.buffer.toString("base64");
     const mimeType = req.file.mimetype;
@@ -819,7 +918,7 @@ ${pages.map(p => `  <url>
     .catch(err => console.error("[backup] Image backup check failed:", err));
 
   // Auth routes
-  app.post("/api/auth/register", async (req, res) => {
+  app.post("/api/auth/register", registerRateLimit, async (req, res) => {
     try {
       const parsed = insertUserSchema.safeParse(req.body);
       if (!parsed.success) return res.status(400).json({ message: "Invalid data", errors: parsed.error.errors });
@@ -832,7 +931,7 @@ ${pages.map(p => `  <url>
 
       const user = await storage.createUser({
         ...parsed.data,
-        password: hashPassword(parsed.data.password),
+        password: await hashPassword(parsed.data.password),
       });
 
       scheduleBackup(5);
@@ -900,7 +999,7 @@ ${pages.map(p => `  <url>
       if (password) {
         if (password.length < 6) return res.status(400).json({ message: "Password must be at least 6 characters" });
         if (password !== confirmPassword) return res.status(400).json({ message: "Passwords do not match" });
-        updateData.password = hashPassword(password);
+        updateData.password = await hashPassword(password);
       }
       if (phone !== undefined) updateData.phone = phone;
       if (profession) updateData.profession = profession;
@@ -948,14 +1047,14 @@ ${pages.map(p => `  <url>
     res.json(allStores);
   });
 
-  app.get("/api/admin/stores/pending-nics", isAuthenticated, isAdmin, async (req, res) => {
-    const ownerIds = await getLinkedUserIds(req);
-    if (ownerIds !== null && ownerIds.length === 0) return res.json([]);
-    const pending = await db.select({ id: stores.id, nicImageUrl: stores.nicImageUrl })
-      .from(stores).where(ownerIds === null
-        ? eq(stores.isApproved, false)
-        : and(eq(stores.isApproved, false), inArray(stores.ownerId, ownerIds)));
-    res.json(pending);
+  // Identity documents are fetched individually by a superadmin, never with
+  // the public store list or a bulk admin response.
+  app.get("/api/admin/stores/:id/identity-document", isAuthenticated, isSuperAdmin, async (req, res) => {
+    const [document] = await db.select({ id: stores.id, nicImageUrl: stores.nicImageUrl })
+      .from(stores).where(eq(stores.id, req.params.id)).limit(1);
+    if (!document) return res.status(404).json({ message: "Store not found" });
+    res.setHeader("Cache-Control", "no-store");
+    res.json(document);
   });
 
   app.get("/api/stores/my", isAuthenticated, async (req, res) => {
@@ -965,10 +1064,10 @@ ${pages.map(p => `  <url>
   });
 
   app.get("/api/stores/:id", async (req, res) => {
-    const { nicImageUrl, ...publicColumns } = getTableColumns(stores);
-    const [store] = await db.select(publicColumns).from(stores).where(eq(stores.id, req.params.id)).limit(1);
+    const store = await storage.getStore(req.params.id);
     if (!store) return res.status(404).json({ message: "Store not found" });
-    res.json(store);
+    const { nicImageUrl, ...publicStore } = store;
+    res.json(publicStore);
   });
 
   app.post("/api/stores", isAuthenticated, isNotFrozen, async (req, res) => {
@@ -1012,14 +1111,27 @@ ${pages.map(p => `  <url>
   });
 
   app.delete("/api/stores/:id", isAuthenticated, async (req, res) => {
-    const store = await storage.getStore(req.params.id);
-    if (!store) return res.status(404).json({ message: "Store not found" });
-    if (store.ownerId !== (req.user as any).id && (req.user as any).role !== "admin") {
-      return res.status(403).json({ message: "Forbidden" });
+    try {
+      const storeId = String(req.params.id);
+      const store = await storage.getStore(storeId);
+      if (!store) return res.status(404).json({ message: "Store not found" });
+      if ((req.user as any).role === "superadmin") {
+        const result = await permanentlyDeleteMerchant(pool, store.ownerId, storeId);
+        if (!result.ok) return res.status(result.status).json({ message: result.message });
+        disconnectDeletedUser(store.ownerId);
+        scheduleImageBackup(2);
+        await notifyDataSync("users", "delete", store.ownerId);
+        await notifyDataSync("stores", "delete", storeId);
+        return res.json({ message: "Merchant, all owned stores and linked records permanently deleted" });
+      }
+      if (store.ownerId !== (req.user as any).id) return res.status(403).json({ message: "Forbidden" });
+      await storage.deleteStore(storeId);
+      notifyDataSync("stores", "delete", storeId);
+      res.json({ message: "Store deleted" });
+    } catch (err) {
+      console.error("[delete] Store deletion failed:", err);
+      res.status(500).json({ message: "Store deletion failed; no merchant data was removed" });
     }
-    await storage.deleteStore(req.params.id);
-    notifyDataSync("stores", "delete", req.params.id);
-    res.json({ message: "Store deleted" });
   });
 
   app.patch("/api/stores/:id/visitors", isAuthenticated, isAdmin, async (req, res) => {
@@ -1640,94 +1752,55 @@ Leave any image cell blank if no photo exists for that slot.
     try {
       const product = await storage.getProduct(req.body.productId);
       if (!product) return res.status(404).json({ message: "Product not found" });
-      if (product.stock < (req.body.quantity || 1)) return res.status(400).json({ message: "Insufficient stock" });
-
-      const totalPrice = (parseFloat(product.price) * (req.body.quantity || 1)).toFixed(2);
-
-      const buyer = await storage.getUser((req.user as any).id);
-      if (!buyer) return res.status(404).json({ message: "User not found" });
-      const userBalance = parseFloat(buyer.balance || "0");
-      if (userBalance < parseFloat(totalPrice)) {
-        return res.status(400).json({ message: "Insufficient balance. Please recharge your account before purchasing." });
+      const buyerId = (req.user as any).id;
+      const quantity = req.body.quantity ?? 1;
+      if (!Number.isSafeInteger(quantity) || quantity <= 0) return res.status(400).json({ message: "Quantity must be a positive whole number" });
+      const unitPrice = Number(product.price);
+      if (!Number.isFinite(unitPrice) || unitPrice <= 0) return res.status(400).json({ message: "Product price must be a positive finite amount" });
+      const totalPrice = (unitPrice * quantity).toFixed(2);
+      const buyForStoreId = req.body.buyForStore ? req.body.storeId : undefined;
+      if (req.body.buyForStore && !buyForStoreId) return res.status(400).json({ message: "Store ID is required for buy-for-store" });
+      if (buyForStoreId) {
+        const targetStore = await storage.getStore(buyForStoreId);
+        if (!targetStore) return res.status(404).json({ message: "Target store not found" });
+        if (targetStore.ownerId !== buyerId) return res.status(403).json({ message: "You can only stock products in your own store" });
       }
 
       const parsed = insertOrderSchema.safeParse({
         ...req.body,
-        buyerId: (req.user as any).id,
+        buyerId,
         storeId: product.storeId,
+        quantity,
         totalPrice,
+        payPrice: "0",
+        profit: "0",
+        status: "pending",
+        orderedBy: null,
       });
       if (!parsed.success) return res.status(400).json({ message: "Invalid data", errors: parsed.error.errors });
 
-      const order = await storage.createOrder(parsed.data);
-      await storage.updateProduct(product.id, { stock: product.stock - (req.body.quantity || 1) });
+      const purchase = await createDirectPurchase(pool, buyerId, product.id, quantity, parsed.data, buyForStoreId);
+      if (!purchase.ok) return res.status(purchase.status).json({ message: purchase.message, ...(purchase.details || {}) });
+      const { order } = purchase.value;
+      notifyDataSync("orders", "create", order.id);
+      if (buyForStoreId) notifyDataSync("products", "update");
 
-      const newBalance = (userBalance - parseFloat(totalPrice)).toFixed(2);
-      await storage.updateUser(buyer.id, {
-        balance: newBalance,
-      } as any);
-      await storage.createRechargeRecord({
-        userId: buyer.id,
-        amount: (-parseFloat(totalPrice)).toFixed(2),
-        previousBalance: userBalance.toFixed(2),
-        newBalance,
-        rechargedBy: buyer.id,
-        note: "Product purchase",
-      });
-
-      const userTargets = await storage.getTargetsByUser((req.user as any).id);
-      for (const target of userTargets) {
-        if (target.status === "active") {
-          const newAmount = parseFloat(target.currentAmount) + parseFloat(totalPrice);
-          const targetAmountNum = parseFloat(target.targetAmount);
-          await storage.updateTarget(target.id, {
-            currentAmount: newAmount.toFixed(2) as any,
-            status: newAmount >= targetAmountNum ? "completed" : "active",
-          });
-        }
-      }
-
-      if (req.body.buyForStore) {
-        if (!req.body.storeId) {
-          return res.status(400).json({ message: "Store ID is required for buy-for-store" });
-        }
-        const targetStore = await storage.getStore(req.body.storeId);
-        if (!targetStore) {
-          return res.status(404).json({ message: "Target store not found" });
-        }
-        if (targetStore.ownerId !== (req.user as any).id) {
-          return res.status(403).json({ message: "You can only stock products in your own store" });
-        }
-        {
-          // Always use admin's product price — store owners cannot set custom prices
-          const adminPrice = product.price;
-          const existingProducts = await storage.getProductsByStore(req.body.storeId);
-          const existingResell = existingProducts.find(
-            (ep: any) => ep.adminProductId === product.id || ep.name === product.name
-          );
-          if (existingResell) {
-            await storage.updateProduct(existingResell.id, {
-              stock: existingResell.stock + (req.body.quantity || 1),
-              price: adminPrice,
+      try {
+        const userTargets = await storage.getTargetsByUser(buyerId);
+        for (const target of userTargets) {
+          if (target.status === "active") {
+            const newAmount = Number(target.currentAmount) + Number(purchase.value.totalCost);
+            const targetAmountNum = Number(target.targetAmount);
+            await storage.updateTarget(target.id, {
+              currentAmount: newAmount.toFixed(2) as any,
+              status: newAmount >= targetAmountNum ? "completed" : "active",
             });
-          } else {
-            await storage.createProduct({
-              name: product.name,
-              description: product.description,
-              price: adminPrice,
-              costPrice: adminPrice,
-              stock: req.body.quantity || 1,
-              category: product.category,
-              imageUrl: product.imageUrl,
-              storeId: req.body.storeId,
-              isAdminProduct: false,
-              adminProductId: product.id,
-            } as any);
           }
         }
+      } catch (error) {
+        console.error("[orders] Purchase committed, but target progress update failed:", error);
       }
 
-      notifyDataSync("orders", "create", order.id);
       res.json(order);
     } catch (err: any) {
       res.status(500).json({ message: err.message });
@@ -1759,8 +1832,8 @@ Leave any image cell blank if no photo exists for that slot.
       for (let i = 0; i < items.length; i++) {
         const item = items[i];
         if (!item.productId) return res.status(400).json({ message: `Item ${i + 1}: Product is required` });
-        if (!item.quantity || item.quantity < 1) return res.status(400).json({ message: `Item ${i + 1}: Quantity must be at least 1` });
-        if (!item.sellingPrice || item.sellingPrice <= 0) return res.status(400).json({ message: `Item ${i + 1}: Selling price must be positive` });
+        if (!Number.isSafeInteger(item.quantity) || item.quantity < 1) return res.status(400).json({ message: `Item ${i + 1}: Quantity must be a positive whole number` });
+        if (!Number.isFinite(Number(item.sellingPrice)) || Number(item.sellingPrice) <= 0) return res.status(400).json({ message: `Item ${i + 1}: Selling price must be a positive finite amount` });
 
         const product = await storage.getProduct(item.productId);
         if (!product) return res.status(400).json({ message: `Item ${i + 1}: Product not found` });
@@ -1778,8 +1851,9 @@ Leave any image cell blank if no photo exists for that slot.
 
       for (const { product, ...item } of validatedItems) {
         const qty = item.quantity;
-        const costPrice = parseFloat(product.costPrice || "0");
-        const sellingPrice = parseFloat(String(item.sellingPrice));
+        const costPrice = Number(product.costPrice || "0");
+        const sellingPrice = Number(item.sellingPrice);
+        if (!Number.isFinite(costPrice) || costPrice <= 0 || sellingPrice < costPrice) return res.status(400).json({ message: "Selling amount must cover a valid positive cost" });
         const totalCost = (costPrice * qty).toFixed(2);
         const totalPrice = (sellingPrice * qty).toFixed(2);
         const profit = ((sellingPrice - costPrice) * qty).toFixed(2);
@@ -1887,15 +1961,16 @@ Leave any image cell blank if no photo exists for that slot.
       for (let i = 0; i < items.length; i++) {
         const item = items[i];
         if (!item.productId) return res.status(400).json({ message: `Item ${i + 1}: product is required` });
-        if (!item.quantity || item.quantity < 1) return res.status(400).json({ message: `Item ${i + 1}: quantity must be at least 1` });
-        if (item.profitAmount < 0) return res.status(400).json({ message: `Item ${i + 1}: profit cannot be negative` });
+        if (!Number.isSafeInteger(item.quantity) || item.quantity < 1) return res.status(400).json({ message: `Item ${i + 1}: quantity must be a positive whole number` });
+        if (!Number.isFinite(Number(item.profitAmount)) || Number(item.profitAmount) < 0) return res.status(400).json({ message: `Item ${i + 1}: profit must be a finite non-negative amount` });
 
         const product = await storage.getProduct(item.productId);
         if (!product) return res.status(404).json({ message: `Item ${i + 1}: product not found` });
         if (product.storeId !== storeId) return res.status(400).json({ message: `Item ${i + 1}: "${product.name}" does not belong to this store` });
 
-        const costPrice = parseFloat(product.price);
-        const profitAmount = parseFloat(String(item.profitAmount || 0));
+        const costPrice = Number(product.price);
+        const profitAmount = Number(item.profitAmount);
+        if (!Number.isFinite(costPrice) || costPrice <= 0 || !Number.isFinite(profitAmount)) return res.status(400).json({ message: `Item ${i + 1}: cost and profit must be valid amounts` });
         const sellingPrice = costPrice + profitAmount;
 
         totalCost += costPrice * item.quantity;
@@ -1927,6 +2002,7 @@ Leave any image cell blank if no photo exists for that slot.
           sellingPrice: String(vi.sellingPrice),
         } as any);
       }
+      notifyDataSync("bulkOrders", "create", bulkOrder.id);
 
       // Notify store owner
       await storage.createNotice({
@@ -1958,8 +2034,13 @@ Leave any image cell blank if no photo exists for that slot.
       const expiredIds = allOrders
         .filter(bo => bo.status === "pending" && new Date(bo.expiresAt) < now)
         .map(bo => bo.id);
-      if (expiredIds.length > 0) {
-        await Promise.all(expiredIds.map(id => storage.updateBulkOrder(id, { status: "expired" })));
+      const persistedStatuses = new Map<string, string>();
+      for (const id of expiredIds) {
+        const persistedStatus = await expireBulkOrderIfPending(pool, id);
+        if (persistedStatus) {
+          persistedStatuses.set(id, persistedStatus.status);
+          if (persistedStatus.changed) notifyDataSync("bulkOrders", "update", id);
+        }
       }
 
       // Batch fetch unique stores and admins
@@ -1980,7 +2061,7 @@ Leave any image cell blank if no photo exists for that slot.
 
       const withItems = allOrders.map(bo => ({
         ...bo,
-        status: expiredIds.includes(bo.id) ? "expired" : bo.status,
+        status: persistedStatuses.get(bo.id) ?? bo.status,
         items: itemsByOrder.get(bo.id) ?? [],
         storeName: storeMap.get(bo.storeId)?.name,
         adminUsername: adminMap.get(bo.adminId)?.username,
@@ -1995,27 +2076,23 @@ Leave any image cell blank if no photo exists for that slot.
   // Admin: update bulk order (edit profit totals, status, complete)
   app.patch("/api/admin/bulk-orders/:id", isAuthenticated, isAdmin, async (req, res) => {
     try {
-      const bo = await storage.getBulkOrder(req.params.id);
-      if (!bo) return res.status(404).json({ message: "Bulk order not found" });
-
-      const updates: any = {};
-      if (req.body.totalProfit !== undefined) updates.totalProfit = String(req.body.totalProfit);
-      if (req.body.totalCost !== undefined) updates.totalCost = String(req.body.totalCost);
-      if (req.body.status !== undefined) updates.status = req.body.status;
-      if (req.body.shippingAddress !== undefined) updates.shippingAddress = req.body.shippingAddress;
-      if (req.body.note !== undefined) updates.note = req.body.note;
-      if (req.body.extendHours !== undefined) {
-        const h = parseFloat(req.body.extendHours);
-        if (isNaN(h) || h <= 0) return res.status(400).json({ message: "extendHours must be a positive number" });
-        const current = bo.expiresAt ? new Date(bo.expiresAt) : new Date();
-        // If already expired, extend from now; otherwise extend from current expiry
-        const base = current < new Date() ? new Date() : current;
-        updates.expiresAt = new Date(base.getTime() + h * 60 * 60 * 1000);
+      const result = await updateBulkOrder(pool, req.params.id, (req.user as any).id, (req.user as any).role === "superadmin", req.body);
+      if (!result.ok) return res.status(result.status).json({ message: result.message, ...(result.details || {}) });
+      if (result.value.statusChanged && ["completed", "expired"].includes(req.body.status)) {
+        notifyDataSync("bulkOrders", "update", req.params.id);
       }
-
-      const updated = await storage.updateBulkOrder(bo.id, updates);
-      const items = await storage.getBulkOrderItems(bo.id);
-      res.json({ ...updated, items });
+      const bo = await storage.getBulkOrder(req.params.id);
+      const items = await storage.getBulkOrderItems(req.params.id);
+      if (req.body.status === "completed" && bo) {
+        await storage.createNotice({
+          userId: (await storage.getStore(bo.storeId))?.ownerId,
+          storeId: bo.storeId,
+          type: "system",
+          title: "Bulk Order Completed",
+          content: `Bulk order ${bo.batchSn} has been completed and the selling amount has been credited.`,
+        });
+      }
+      res.json({ ...bo, items });
     } catch (err: any) {
       res.status(500).json({ message: err.message });
     }
@@ -2033,7 +2110,11 @@ Leave any image cell blank if no photo exists for that slot.
         for (let bo of orders) {
           // Auto-expire pending orders past expiry
           if (bo.status === "pending" && new Date(bo.expiresAt) < now) {
-            bo = (await storage.updateBulkOrder(bo.id, { status: "expired" })) || bo;
+            const persistedStatus = await expireBulkOrderIfPending(pool, bo.id);
+            if (persistedStatus) {
+              bo = { ...bo, status: persistedStatus.status as any };
+              if (persistedStatus.changed) notifyDataSync("bulkOrders", "update", bo.id);
+            }
           }
           const items = await storage.getBulkOrderItems(bo.id);
           allBulkOrders.push({ ...bo, items, storeName: store.name });
@@ -2049,47 +2130,15 @@ Leave any image cell blank if no photo exists for that slot.
   app.patch("/api/bulk-orders/:id/accept", isAuthenticated, isNotFrozen, async (req, res) => {
     try {
       const userId = (req.user as any).id;
-      const bo = await storage.getBulkOrder(req.params.id);
-      if (!bo) return res.status(404).json({ message: "Bulk order not found" });
-
-      const store = await storage.getStore(bo.storeId);
-      if (!store || store.ownerId !== userId) return res.status(403).json({ message: "You do not own this store" });
-
-      if (bo.status !== "pending") return res.status(400).json({ message: `Order is already ${bo.status}` });
-      if (new Date(bo.expiresAt) < new Date()) {
-        await storage.updateBulkOrder(bo.id, { status: "expired" });
+      const result = await acceptBulkOrder(pool, req.params.id, userId);
+      if (!result.ok) return res.status(result.status).json({ message: result.message, ...(result.details || {}) });
+      if (result.value.expired) {
+        notifyDataSync("bulkOrders", "update", req.params.id);
         return res.status(400).json({ message: "This order has expired" });
       }
-
-      const user = await storage.getUser(userId);
-      if (!user) return res.status(404).json({ message: "User not found" });
-
-      const cost = parseFloat(bo.totalCost);
-      const balance = parseFloat(user.balance);
-      if (balance < cost) {
-        return res.status(400).json({
-          message: `Insufficient balance. You need $${cost.toFixed(2)} but have $${balance.toFixed(2)}. Please contact customer service to top up your account.`,
-          insufficientBalance: true,
-          required: cost,
-          available: balance,
-        });
-      }
-
-      // Deduct balance
-      const newBalance = (balance - cost).toFixed(2);
-      await storage.updateUser(userId, { balance: newBalance });
-      await storage.createRechargeRecord({
-        userId,
-        amount: (-cost).toFixed(2),
-        previousBalance: balance.toFixed(2),
-        newBalance,
-        rechargedBy: userId,
-        note: `Bulk order payment ${bo.batchSn}`,
-      });
-
-      const updated = await storage.updateBulkOrder(bo.id, { status: "accepted", acceptedAt: new Date() });
-      const items = await storage.getBulkOrderItems(bo.id);
-      res.json({ ...updated, items });
+      notifyDataSync("bulkOrders", "update", req.params.id);
+      const items = await storage.getBulkOrderItems(req.params.id);
+      res.json({ ...(await storage.getBulkOrder(req.params.id)), items });
     } catch (err: any) {
       res.status(500).json({ message: err.message });
     }
@@ -2107,7 +2156,10 @@ Leave any image cell blank if no photo exists for that slot.
 
       if (bo.status !== "pending") return res.status(400).json({ message: `Order is already ${bo.status}` });
 
-      const updated = await storage.updateBulkOrder(bo.id, { status: "declined" });
+      const [updated] = await db.update(bulkOrders).set({ status: "declined" })
+        .where(and(eq(bulkOrders.id, bo.id), eq(bulkOrders.status, "pending"))).returning();
+      if (!updated) return res.status(400).json({ message: "Bulk order is no longer pending" });
+      notifyDataSync("bulkOrders", "update", bo.id);
       const items = await storage.getBulkOrderItems(bo.id);
       res.json({ ...updated, items });
     } catch (err: any) {
@@ -2197,24 +2249,25 @@ Leave any image cell blank if no photo exists for that slot.
   });
 
   app.patch("/api/orders/:id/status", isAuthenticated, isSuperAdmin, async (req, res) => {
-    const order = await storage.getOrder(req.params.id);
-    if (!order) return res.status(404).json({ message: "Order not found" });
-    const updated = await storage.updateOrderStatus(req.params.id, req.body.status);
-    if (!updated) return res.status(404).json({ message: "Order not found" });
+    if (req.body.status !== "cancelled") return res.status(400).json({ message: "Use pickup and completion actions for financial order transitions" });
+    const result = await cancelPendingOrder(pool, String(req.params.id));
+    if (!result.ok) return res.status(result.status).json({ message: result.message });
     notifyDataSync("orders", "update", req.params.id);
-    res.json(updated);
+    res.json(result.value);
   });
 
   app.patch("/api/orders/:id/complete", isAuthenticated, isAdmin, async (req, res) => {
     try {
       const order = await storage.getOrder(req.params.id);
       if (!order) return res.status(404).json({ message: "Order not found" });
-      if (order.status !== "processing") return res.status(400).json({ message: "Only processing orders can be completed" });
       const linkedIds = await getLinkedUserIds(req);
       if (linkedIds !== null && !linkedIds.includes(order.buyerId)) {
         return res.status(403).json({ message: "You can only manage your linked customers' orders" });
       }
-      const updated = await storage.updateOrderStatus(req.params.id, "completed");
+      const result = await completeOrder(pool, req.params.id);
+      if (!result.ok) return res.status(result.status).json({ message: result.message });
+      notifyDataSync("orders", "update", req.params.id);
+      const updated = await storage.getOrder(req.params.id);
       await storage.createNotice({
         userId: order.buyerId,
         type: "system",
@@ -2234,16 +2287,10 @@ Leave any image cell blank if no photo exists for that slot.
       if (order.buyerId !== (req.user as any).id) return res.status(403).json({ message: "Forbidden" });
       if (order.status !== "pending") return res.status(400).json({ message: "Only pending orders can be removed" });
 
-      const product = await storage.getProduct(order.productId);
-      if (product) {
-        await storage.updateProduct(product.id, {
-          stock: product.stock + order.quantity,
-          salesCount: Math.max(0, (product.salesCount ?? 0) - order.quantity),
-        });
-      }
-
-      const updated = await storage.updateOrderStatus(req.params.id, "cancelled");
-      res.json(updated);
+      const result = await cancelPendingOrder(pool, String(req.params.id));
+      if (!result.ok) return res.status(result.status).json({ message: result.message });
+      notifyDataSync("orders", "update", req.params.id);
+      res.json(result.value);
     } catch (err: any) {
       res.status(500).json({ message: err.message });
     }
@@ -2251,36 +2298,12 @@ Leave any image cell blank if no photo exists for that slot.
 
   app.patch("/api/orders/:id/pickup", isAuthenticated, isNotFrozen, async (req, res) => {
     try {
+      const result = await pickupOrder(pool, req.params.id, (req.user as any).id);
+      if (!result.ok) return res.status(result.status).json({ message: result.message });
+      notifyDataSync("orders", "update", req.params.id);
       const order = await storage.getOrder(req.params.id);
       if (!order) return res.status(404).json({ message: "Order not found" });
-      if (order.buyerId !== (req.user as any).id) return res.status(403).json({ message: "Forbidden" });
-      if (order.status !== "pending") return res.status(400).json({ message: "Order cannot be picked up" });
-
-      const isAdminAssigned = order.orderedBy && order.orderedBy !== order.buyerId;
-
-      if (isAdminAssigned) {
-        const buyer = await storage.getUser((req.user as any).id);
-        if (!buyer) return res.status(404).json({ message: "User not found" });
-        const orderCost = parseFloat(order.totalPrice || "0");
-        const userBalance = parseFloat(buyer.balance || "0");
-        if (userBalance < orderCost) {
-          return res.status(400).json({ message: `Insufficient balance. You need $${orderCost.toFixed(2)} but have $${userBalance.toFixed(2)}. Please recharge first.` });
-        }
-        const newBal = (userBalance - orderCost).toFixed(2);
-        await storage.updateUser(buyer.id, {
-          balance: newBal,
-        } as any);
-        await storage.createRechargeRecord({
-          userId: buyer.id,
-          amount: (-orderCost).toFixed(2),
-          previousBalance: userBalance.toFixed(2),
-          newBalance: newBal,
-          rechargedBy: buyer.id,
-          note: `Order pickup #${order.orderSn}`,
-        });
-      }
-
-      const updated = await storage.updateOrderStatus(req.params.id, "processing");
+      const updated = order;
 
       const product = await storage.getProduct(order.productId);
       const store = product ? await storage.getStore(product.storeId) : null;
@@ -2301,50 +2324,19 @@ Leave any image cell blank if no photo exists for that slot.
   app.post("/api/orders/pickup-all", isAuthenticated, isNotFrozen, async (req, res) => {
     try {
       const userId = (req.user as any).id;
-      const buyer = await storage.getUser(userId);
-      if (!buyer) return res.status(404).json({ message: "User not found" });
-
-      const myOrders = await storage.getOrdersByBuyer(userId);
-      const pendingOrders = myOrders.filter(o => o.status === "pending");
-      const adminAssignedOrders = pendingOrders.filter(o => o.orderedBy && o.orderedBy !== o.buyerId);
-      const totalCost = adminAssignedOrders.reduce((sum, o) => sum + parseFloat(o.totalPrice || "0"), 0);
-      const userBalance = parseFloat(buyer.balance || "0");
-
-      if (userBalance < totalCost) {
-        return res.status(400).json({ message: `Insufficient balance. You need $${totalCost.toFixed(2)} but have $${userBalance.toFixed(2)}. Please recharge first.` });
-      }
-
-      const results = [];
-      for (const order of pendingOrders) {
-        const updated = await storage.updateOrderStatus(order.id, "processing");
-        if (updated) results.push(updated);
-      }
-
-      if (totalCost > 0) {
-        const newBulkBal = (userBalance - totalCost).toFixed(2);
-        await storage.updateUser(buyer.id, {
-          balance: newBulkBal,
-        } as any);
-        await storage.createRechargeRecord({
-          userId,
-          amount: (-totalCost).toFixed(2),
-          previousBalance: userBalance.toFixed(2),
-          newBalance: newBulkBal,
-          rechargedBy: userId,
-          note: `Bulk pickup of ${results.length} order(s)`,
-        });
-      }
-
-      if (results.length > 0) {
+      const result = await pickupAllOrders(pool, userId);
+      if (!result.ok) return res.status(result.status).json({ message: result.message });
+      if (result.value.updated > 0) {
+        notifyDataSync("orders", "update");
         await storage.createNotice({
           userId,
           type: "info",
           title: "Orders Picked Up - Buy Items",
-          content: `You have picked up ${results.length} order(s). Please buy the required items from the marketplace to fulfill your orders. Contact admin via live chat for payment details and send proof of payment.`,
+          content: `You have picked up ${result.value.updated} order(s). Please buy the required items from the marketplace to fulfill your orders. Contact admin via live chat for payment details and send proof of payment.`,
         });
       }
 
-      res.json({ updated: results.length });
+      res.json(result.value);
     } catch (err: any) {
       res.status(500).json({ message: err.message });
     }
@@ -2502,45 +2494,35 @@ Leave any image cell blank if no photo exists for that slot.
   });
 
   app.patch("/api/users/:id", isAuthenticated, isAdmin, async (req, res) => {
+    const targetUserId = String(req.params.id);
     const linkedIds = await getLinkedUserIds(req);
-    if (linkedIds !== null && !linkedIds.includes(req.params.id)) {
+    if (linkedIds !== null && !linkedIds.includes(targetUserId)) {
       return res.status(403).json({ message: "You can only manage your own linked customers" });
     }
-    const user = await storage.getUser(req.params.id);
-    if (!user) return res.status(404).json({ message: "User not found" });
+    const targetUser = await storage.getUser(targetUserId);
+    if (!targetUser) return res.status(404).json({ message: "User not found" });
     const allowedFields = ["balance", "grade", "credit", "goodRate", "phone", "vipLevel", "rating"];
     const updateData: any = {};
     for (const field of allowedFields) {
       if (req.body[field] !== undefined) updateData[field] = req.body[field];
     }
-    const balanceChanged = updateData.balance !== undefined;
-    if (balanceChanged) {
-      const value = String(updateData.balance).trim();
-      if (!/^\d+(?:\.\d{1,2})?$/.test(value) || !Number.isFinite(Number(value)) || Number(value) > 9999999999.99) {
-        return res.status(400).json({ message: "Balance must be a non-negative amount with at most two decimal places" });
-      }
-      updateData.balance = Number(value).toFixed(2);
-    }
-    const updated = balanceChanged
-      ? await storage.updateUserWithRecharge(req.params.id, updateData, {
-          userId: req.params.id,
-          rechargedBy: (req.user as any).id,
-          note: typeof req.body.rechargeNote === "string" ? req.body.rechargeNote.slice(0, 500) : "Balance update by admin",
-        } as any)
-      : await storage.updateUser(req.params.id, updateData);
-    if (!updated) return res.status(404).json({ message: "User not found" });
+    const result = await adminUpdateUserFinance(
+      pool, targetUserId, (req.user as any).id, updateData, req.body.rechargeNote || "Balance update by admin",
+    );
+    if (!result.ok) return res.status(result.status).json({ message: result.message });
+    const updated = result.value;
     const changedFields = Object.keys(updateData).filter(field => field !== "balance");
-    if (changedFields.length) {
+    if (changedFields.length > 0) {
       await storage.createAdminAction({
         actorId: (req.user as any).id,
         action: "user_update",
-        targetId: user.id,
-        targetUsername: user.username,
-        targetEmail: user.email,
+        targetId: targetUser.id,
+        targetUsername: targetUser.username,
+        targetEmail: targetUser.email,
         details: `Updated fields: ${changedFields.join(", ")}`,
       });
     }
-    notifyDataSync("users", "update", req.params.id);
+    notifyDataSync("users", "update", targetUserId);
     const { password, ...safeUser } = updated;
     res.json(safeUser);
   });
@@ -2566,8 +2548,6 @@ Leave any image cell blank if no photo exists for that slot.
       sql`lower(trim(${users.referenceCode})) = ${normalizedCode}`,
       inArray(users.role, ["admin", "superadmin"]),
     )).limit(1);
-    // A removed admin loses their reference code, but existing stores retain
-    // the code used at registration and the customer's original referral.
     let administrator: typeof activeAdministrator | undefined = activeAdministrator;
     if (!administrator && requester.role === "superadmin") {
       const historical = await pool.query<NonNullable<typeof activeAdministrator>>(
@@ -2595,17 +2575,18 @@ Leave any image cell blank if no photo exists for that slot.
     }).from(stores)
       .innerJoin(users, eq(stores.ownerId, users.id))
       .where(sql`lower(trim(${stores.referenceCode})) = ${normalizedCode}`);
-    res.json({
-      administrator,
-      customers: rows,
-    });
+    res.json({ administrator, customers: rows });
   });
 
   app.get("/api/admin/actions", isAuthenticated, isSuperAdmin, async (req, res) => {
     const rawLimit = typeof req.query.limit === "string" ? Number(req.query.limit) : 100;
-    if (!Number.isInteger(rawLimit) || rawLimit < 1) return res.status(400).json({ message: "limit must be a positive integer" });
+    if (!Number.isInteger(rawLimit) || rawLimit < 1) {
+      return res.status(400).json({ message: "limit must be a positive integer" });
+    }
     const limit = Math.min(rawLimit, 500);
-    const adminId = typeof req.query.adminId === "string" && req.query.adminId.trim() ? req.query.adminId.trim() : null;
+    const adminId = typeof req.query.adminId === "string" && req.query.adminId.trim()
+      ? req.query.adminId.trim()
+      : null;
     const result = await pool.query(`
       SELECT id, actor_id AS "actorId", actor_username AS "actorUsername", actor_email AS "actorEmail",
              action, target_id AS "targetId", target_username AS "targetUsername", target_email AS "targetEmail",
@@ -2650,7 +2631,7 @@ Leave any image cell blank if no photo exists for that slot.
       if (!newPassword || newPassword.length < 6) {
         return res.status(400).json({ message: "Password must be at least 6 characters" });
       }
-      const updated = await storage.updateUser(req.params.id, { password: hashPassword(newPassword) } as any);
+      const updated = await storage.updateUser(req.params.id, { password: await hashPassword(newPassword) } as any);
       if (!updated) return res.status(404).json({ message: "User not found" });
       res.json({ message: "Password updated successfully" });
     } catch (err: any) {
@@ -2677,7 +2658,7 @@ Leave any image cell blank if no photo exists for that slot.
       const existing = await storage.getUserByEmail(email);
       if (existing) return res.status(400).json({ message: "Email already in use" });
       const refCode = generateReferenceCode();
-      const admin = await storage.createUser({ email, username, password: hashPassword(pw), age: age || 25, profession: profession || "Admin", phone: phone || "" } as any);
+      const admin = await storage.createUser({ email, username, password: await hashPassword(pw), age: age || 25, profession: profession || "Admin", phone: phone || "" } as any);
       const updated = await storage.updateUser(admin.id, { role: "admin", referenceCode: refCode } as any);
       if (!updated) return res.status(500).json({ message: "Failed to create admin" });
       const { password: p, ...safeAdmin } = updated;
@@ -2688,11 +2669,19 @@ Leave any image cell blank if no photo exists for that slot.
   });
 
   app.delete("/api/admins/:id", isAuthenticated, isSuperAdmin, async (req, res) => {
-    const user = await storage.getUser(req.params.id);
-    if (!user) return res.status(404).json({ message: "Admin not found" });
-    if (user.role === "superadmin") return res.status(400).json({ message: "Cannot remove super admin" });
-    await storage.updateUser(req.params.id, { role: "client", referenceCode: null } as any);
-    res.json({ message: "Admin removed" });
+    try {
+      const adminId = String(req.params.id);
+      const result = await permanentlyDeleteMerchant(pool, adminId, undefined, "admin");
+      if (!result.ok) return res.status(result.status).json({ message: result.message });
+      disconnectDeletedUser(adminId);
+      scheduleImageBackup(2);
+      await notifyDataSync("users", "delete", adminId);
+      await notifyDataSync("stores", "delete");
+      res.json({ message: "Admin account, reference code and linked records permanently deleted" });
+    } catch (err) {
+      console.error("[delete] Admin deletion failed:", err);
+      res.status(500).json({ message: "Admin deletion failed; no admin data was removed" });
+    }
   });
 
   app.post("/api/superadmins", isAuthenticated, isSuperAdmin, async (req, res) => {
@@ -2701,7 +2690,7 @@ Leave any image cell blank if no photo exists for that slot.
       if (!email || !username || !pw) return res.status(400).json({ message: "Email, username and password are required" });
       const existing = await storage.getUserByEmail(email);
       if (existing) return res.status(400).json({ message: "Email already in use" });
-      const user = await storage.createUser({ email, username, password: hashPassword(pw), age: 25, profession: "Admin", phone: phone || "" } as any);
+      const user = await storage.createUser({ email, username, password: await hashPassword(pw), age: 25, profession: "Admin", phone: phone || "" } as any);
       const updated = await storage.updateUser(user.id, { role: "superadmin" } as any);
       if (!updated) return res.status(500).json({ message: "Failed to create superadmin" });
       const { password: p, ...safe } = updated;
@@ -2717,13 +2706,14 @@ Leave any image cell blank if no photo exists for that slot.
       const adminId = (req.user as any).id;
       const user = await storage.getUser(adminId);
       if (!user) return res.status(404).json({ message: "User not found" });
-      if (user.password !== hashPassword(currentPassword)) {
+      const currentPasswordVerification = await verifyPassword(currentPassword, user.password);
+      if (!currentPasswordVerification.valid) {
         return res.status(400).json({ message: "Current password is incorrect" });
       }
       if (!newPassword || newPassword.length < 6) {
         return res.status(400).json({ message: "New password must be at least 6 characters" });
       }
-      await storage.updateUser(adminId, { password: hashPassword(newPassword) } as any);
+      await storage.updateUser(adminId, { password: await hashPassword(newPassword) } as any);
       res.json({ message: "Password changed successfully" });
     } catch (err: any) {
       res.status(500).json({ message: err.message });
@@ -2762,22 +2752,19 @@ Leave any image cell blank if no photo exists for that slot.
     }
   });
 
-  app.delete("/api/merchants/:id", isAuthenticated, isAdmin, async (req, res) => {
+  app.delete("/api/merchants/:id", isAuthenticated, isSuperAdmin, async (req, res) => {
     try {
-      const merchantId = req.params.id;
-      const merchant = await storage.getUser(merchantId);
-      if (!merchant) return res.status(404).json({ message: "Merchant not found" });
-      if (merchant.role === "admin" || merchant.role === "superadmin") {
-        return res.status(400).json({ message: "Cannot remove admin users via this endpoint" });
-      }
-      const linkedIds = await getLinkedUserIds(req);
-      if (linkedIds !== null && !linkedIds.includes(merchantId)) {
-        return res.status(403).json({ message: "You can only remove your own linked merchants" });
-      }
-      await storage.updateUser(merchantId, { referredBy: null, isFrozen: true } as any);
-      res.json({ message: "Merchant removed from platform" });
-    } catch (err: any) {
-      res.status(500).json({ message: err.message });
+      const merchantId = String(req.params.id);
+      const result = await permanentlyDeleteMerchant(pool, merchantId);
+      if (!result.ok) return res.status(result.status).json({ message: result.message });
+      disconnectDeletedUser(merchantId);
+      scheduleImageBackup(2);
+      await notifyDataSync("users", "delete", merchantId);
+      await notifyDataSync("stores", "delete");
+      res.json({ message: "Merchant, all owned stores and linked records permanently deleted" });
+    } catch (err) {
+      console.error("[delete] Merchant deletion failed:", err);
+      res.status(500).json({ message: "Merchant deletion failed; no merchant data was removed" });
     }
   });
 
@@ -2791,7 +2778,7 @@ Leave any image cell blank if no photo exists for that slot.
       const allUsers = await storage.getAllUsers();
       if (allUsers.find(u => u.username === username)) return res.status(400).json({ message: "Username already in use" });
       const merchant = await storage.createUser({
-        email, username, password: hashPassword(pw),
+        email, username, password: await hashPassword(pw),
         age: age || 25, profession: profession || "Merchant", phone: phone || "",
       } as any);
       const updated = await storage.updateUser(merchant.id, { referredBy: (req.user as any).id } as any);
@@ -2928,6 +2915,8 @@ Leave any image cell blank if no photo exists for that slot.
           products: data.products?.length || 0,
           productImages: data.productImages?.length || 0,
           orders: data.orders?.length || 0,
+          bulkOrders: data.bulkOrders?.length || 0,
+          bulkOrderItems: data.bulkOrderItems?.length || 0,
           targets: data.targets?.length || 0,
           chatMessages: data.chatMessages?.length || 0,
           withdrawals: data.withdrawals?.length || 0,
@@ -2946,24 +2935,26 @@ Leave any image cell blank if no photo exists for that slot.
   // Info about the two Supabase cloud backups (current + previous)
   app.get("/api/admin/supabase-backup/info", isAuthenticated, isSuperAdmin, async (req, res) => {
     try {
-      // Calculate counts in Postgres; never send the multi-megabyte snapshot
-      // payload through the pooler just to render the admin status panel.
-      const rows = await db.select({
-        label: backups.label,
-        createdAt: backups.createdAt,
-        byteSize: sql<number>`octet_length(${backups.data})`,
-        counts: sql<Record<string, number>>`case when ${backups.label} = 'images'
-          then jsonb_build_object('productImages', coalesce(jsonb_array_length((${backups.data})::jsonb -> 'productImages'), 0))
-          else jsonb_build_object(
-            'users', coalesce(jsonb_array_length((${backups.data})::jsonb -> 'users'), 0),
-            'stores', coalesce(jsonb_array_length((${backups.data})::jsonb -> 'stores'), 0),
-            'products', coalesce(jsonb_array_length((${backups.data})::jsonb -> 'products'), 0),
-            'orders', coalesce(jsonb_array_length((${backups.data})::jsonb -> 'orders'), 0),
-            'withdrawals', coalesce(jsonb_array_length((${backups.data})::jsonb -> 'withdrawals'), 0)
-          ) end`,
-      }).from(backups);
+      const rows = await db.select().from(backups);
       const result = rows.map(r => {
-        return { label: r.label, createdAt: r.createdAt, byteSize: r.byteSize, counts: r.counts };
+        let counts: any = {};
+        try {
+          const d = JSON.parse(r.data);
+          if (r.label === "images") {
+            counts = { productImages: d.productImages?.length || 0 };
+          } else {
+            counts = {
+              users: d.users?.length || 0,
+              stores: d.stores?.length || 0,
+              products: d.products?.length || 0,
+              orders: d.orders?.length || 0,
+              bulkOrders: d.bulkOrders?.length || 0,
+              bulkOrderItems: d.bulkOrderItems?.length || 0,
+              withdrawals: d.withdrawals?.length || 0,
+            };
+          }
+        } catch {}
+        return { label: r.label, createdAt: r.createdAt, byteSize: Buffer.byteLength(r.data, "utf-8"), counts };
       });
       // Sort: current, previous, images
       const order = ["current", "previous", "images"];
@@ -3012,18 +3003,18 @@ Leave any image cell blank if no photo exists for that slot.
   // Images are backed up separately in the Supabase 'images' slot.
   app.get("/api/admin/backup/download", isAuthenticated, isSuperAdmin, async (req, res) => {
     try {
-      const [allUsers, allStores, allProducts, allOrders, allTargets, allMessages, allWithdrawals, allNotices, allRecharge, allDailyStats] = await Promise.all([
-        db.select().from(users),
-        db.select().from(stores),
-        db.select().from(products),
-        db.select().from(orders),
-        db.select().from(targets),
-        db.select().from(chatMessages),
-        db.select().from(withdrawals),
-        db.select().from(merchantNotices),
-        db.select().from(rechargeHistory),
-        db.select().from(userDailyStats),
-      ]);
+      const allUsers = await db.select().from(users);
+      const allStores = await db.select().from(stores);
+      const allProducts = await db.select().from(products);
+      const allOrders = await db.select().from(orders);
+      const allBulkOrders = await db.select().from(bulkOrders);
+      const allBulkOrderItems = await db.select().from(bulkOrderItems);
+      const allTargets = await db.select().from(targets);
+      const allMessages = await db.select().from(chatMessages);
+      const allWithdrawals = await db.select().from(withdrawals);
+      const allNotices = await db.select().from(merchantNotices);
+      const allRecharge = await db.select().from(rechargeHistory);
+      const allDailyStats = await db.select().from(userDailyStats);
 
       const backupData = {
         timestamp: new Date().toISOString(),
@@ -3033,6 +3024,8 @@ Leave any image cell blank if no photo exists for that slot.
         stores: allStores,
         products: allProducts,
         orders: allOrders,
+        bulkOrders: allBulkOrders,
+        bulkOrderItems: allBulkOrderItems,
         targets: allTargets,
         chatMessages: allMessages,
         withdrawals: allWithdrawals,
@@ -3095,14 +3088,26 @@ Leave any image cell blank if no photo exists for that slot.
         return res.status(400).json({ message: "Invalid backup file format" });
       }
 
-      // Save as latest backup first so auto-restore can use it in future
       const backupDir = path.join(process.cwd(), "backups");
       if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
-      const backupFile = path.join(backupDir, "latest_backup.json");
-      fs.writeFileSync(backupFile, raw);
-
-      const result = await restoreFromBackup(backupFile);
+      const stagedFile = path.join(backupDir, `restore_${Date.now()}.json`);
+      fs.writeFileSync(stagedFile, raw);
+      let result: Awaited<ReturnType<typeof restoreFromBackup>>;
+      try {
+        result = await restoreFromBackup(stagedFile);
+      } finally {
+        if (fs.existsSync(stagedFile)) fs.unlinkSync(stagedFile);
+      }
       if (result.success) {
+        const backupFile = path.join(backupDir, "latest_backup.json");
+        if (fs.existsSync(backupFile)) {
+          const stamp = Date.now();
+          let archivedFile = path.join(backupDir, `backup_${stamp}.json`);
+          let suffix = 1;
+          while (fs.existsSync(archivedFile)) archivedFile = path.join(backupDir, `backup_${stamp}_${suffix++}.json`);
+          fs.copyFileSync(backupFile, archivedFile);
+        }
+        fs.writeFileSync(backupFile, raw);
         res.json(result);
       } else {
         res.status(400).json(result);
@@ -3170,9 +3175,6 @@ Leave any image cell blank if no photo exists for that slot.
   });
 
   app.patch("/api/stores/:id/approve", isAuthenticated, isAdmin, async (req, res) => {
-    if ((req.user as any)?.role !== "superadmin") {
-      return res.status(403).json({ message: "Please contact a super administrator to approve this store. Only super administrators can approve stores." });
-    }
     const store = await storage.getStore(req.params.id);
     if (!store) return res.status(404).json({ message: "Store not found" });
     const linkedIds = await getLinkedUserIds(req);
@@ -3226,7 +3228,7 @@ Leave any image cell blank if no photo exists for that slot.
     res.json({ message: "Store rejected and deleted" });
   });
 
-  app.post("/api/auth/forgot-password", async (req, res) => {
+  app.post("/api/auth/forgot-password", forgotPasswordRateLimit, async (req, res) => {
     try {
       const { email, phone, nicImageUrl } = req.body;
       if (!email || !phone || !nicImageUrl) {
@@ -3242,26 +3244,27 @@ Leave any image cell blank if no photo exists for that slot.
     }
   });
 
-  app.get("/api/password-resets", isAuthenticated, isAdmin, async (req, res) => {
+  app.get("/api/password-resets", isAuthenticated, isSuperAdmin, async (req, res) => {
     const all = await storage.getAllPasswordResetRequests();
     res.json(all);
   });
 
-  app.patch("/api/password-resets/:id/approve", isAuthenticated, isAdmin, async (req, res) => {
+  app.patch("/api/password-resets/:id/approve", isAuthenticated, isSuperAdmin, async (req, res) => {
     try {
       const requests = await storage.getAllPasswordResetRequests();
       const request = requests.find(r => r.id === req.params.id);
       if (!request) return res.status(404).json({ message: "Request not found" });
       if (request.status !== "pending") return res.status(400).json({ message: "Request already processed" });
-      await storage.updateUser(request.userId, { password: hashPassword("123456") });
+      const temporaryPassword = crypto.randomBytes(18).toString("base64url");
+      await storage.updateUser(request.userId, { password: await hashPassword(temporaryPassword) });
       await storage.updatePasswordResetRequestStatus(req.params.id, "approved");
       await storage.createNotice({
         userId: request.userId,
         type: "system",
         title: "Password Reset Approved",
-        content: "Your password has been reset to 123456. Please login and change your password from your profile.",
+        content: "Your password reset was approved. Please contact support to receive your temporary password, then change it immediately after signing in.",
       });
-      res.json({ message: "Password reset approved" });
+      res.json({ message: "Password reset approved. Securely hand off this temporary password to the account owner; it is shown only once.", temporaryPassword });
     } catch (err: any) {
       res.status(500).json({ message: err.message });
     }
@@ -3329,28 +3332,9 @@ Leave any image cell blank if no photo exists for that slot.
   });
 
   app.patch("/api/withdrawals/:id/status", isAuthenticated, isAdmin, async (req, res) => {
-    const withdrawal = await storage.getWithdrawal(req.params.id);
-    if (!withdrawal) return res.status(404).json({ message: "Withdrawal not found" });
-
-    if (req.body.status === "approved" && withdrawal.status === "pending") {
-      const user = await storage.getUser(withdrawal.userId);
-      if (user) {
-        const prevBal = parseFloat(user.balance);
-        const newBalance = (prevBal - parseFloat(withdrawal.amount)).toFixed(2);
-        await storage.updateUser(user.id, { balance: newBalance } as any);
-        await storage.createRechargeRecord({
-          userId: user.id,
-          amount: (-parseFloat(withdrawal.amount)).toFixed(2),
-          previousBalance: prevBal.toFixed(2),
-          newBalance,
-          rechargedBy: (req.user as any).id,
-          note: `Withdrawal approved #${withdrawal.extractSn}`,
-        });
-      }
-    }
-
-    const updated = await storage.updateWithdrawalStatus(req.params.id, req.body.status);
-    res.json(updated);
+    const result = await updateWithdrawalStatusFinancial(pool, String(req.params.id), (req.user as any).id, req.body.status);
+    if (!result.ok) return res.status(result.status).json({ message: result.message });
+    res.json(result.value);
   });
 
   // Notices routes
@@ -3394,29 +3378,59 @@ Leave any image cell blank if no photo exists for that slot.
   });
 
   app.patch("/api/notices/:id/seen", isAuthenticated, async (req, res) => {
+    const notice = await storage.getNotice(req.params.id);
+    if (!notice || notice.userId !== (req.user as any).id) return res.status(404).json({ message: "Notice not found" });
     const updated = await storage.markNoticeSeen(req.params.id);
     if (!updated) return res.status(404).json({ message: "Notice not found" });
     res.json(updated);
   });
 
   // WebSocket server
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
-
-  wss.on("connection", (ws, req) => {
-    let userId: string | null = null;
-
-    ws.on("message", (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === "auth" && msg.userId) {
-          userId = msg.userId;
-          clients.set(userId, ws);
+  const wss = new WebSocketServer({
+    noServer: true,
+    handleProtocols: protocols => protocols.has("marketnest.jwt") ? "marketnest.jwt" : false,
+  });
+  httpServer.on("upgrade", (req, socket, head) => {
+    if (req.url?.split("?")[0] !== "/ws") return;
+    const origin = req.headers.origin;
+    const host = req.headers.host;
+    const forwardedProto = (req.headers["x-forwarded-proto"] as string | undefined)?.split(",")[0];
+    const requestOrigin = `${forwardedProto || ((req.socket as any).encrypted ? "https" : "http")}://${host}`;
+    if (!origin || (!allowedOrigins.has(origin) && origin !== requestOrigin)) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    const sessionResponse = new ServerResponse(req);
+    sessionMiddleware(req as any, sessionResponse, () => {
+      const protocols = typeof req.headers["sec-websocket-protocol"] === "string"
+        ? req.headers["sec-websocket-protocol"].split(",").map(protocol => protocol.trim())
+        : [];
+      const websocketToken = protocols[0] === "marketnest.jwt" ? protocols[1] : undefined;
+      const sessionUserId = (req as any).session?.passport?.user;
+      const userId = sessionUserId || (websocketToken ? verifyToken(websocketToken)?.userId : undefined);
+      if (!userId) {
+        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+      storage.getUser(userId).then(user => {
+        if (!user) {
+          socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+          socket.destroy();
+          return;
         }
-      } catch {}
-    });
-
-    ws.on("close", () => {
-      if (userId) clients.delete(userId);
+        wss.handleUpgrade(req, socket, head, ws => {
+          clients.set(user.id, ws);
+          ws.on("close", () => {
+            if (clients.get(user.id) === ws) clients.delete(user.id);
+          });
+          wss.emit("connection", ws, req);
+        });
+      }).catch(() => {
+        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+        socket.destroy();
+      });
     });
   });
 
@@ -3439,6 +3453,9 @@ Leave any image cell blank if no photo exists for that slot.
       listenClient!.on("notification", (msg) => {
         try {
           const payload = JSON.parse(msg.payload || "{}");
+          if (payload.entity === "users" && payload.action === "delete" && typeof payload.id === "string") {
+            disconnectDeletedUser(payload.id);
+          }
           broadcastAll({ type: "data_sync", ...payload });
           console.log("[sync] broadcast:", payload.entity, payload.action, payload.id);
         } catch (err) {
@@ -3492,17 +3509,14 @@ Leave any image cell blank if no photo exists for that slot.
 
 async function seedDatabase() {
   try {
+    if (process.env.NODE_ENV === "production" || process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID) return;
     const adminExists = await storage.getAdminUser();
     if (adminExists) return;
-
-    function hashPassword(password: string): string {
-      return crypto.createHash("sha256").update(password + "marketplacesalt").digest("hex");
-    }
 
     const admin = await storage.createUser({
       email: "admin@marketplace.com",
       username: "admin",
-      password: hashPassword("admin123"),
+      password: await hashPassword("admin123"),
       age: 30,
       profession: "Platform Administrator",
       role: "superadmin",
@@ -3512,7 +3526,7 @@ async function seedDatabase() {
     const client1 = await storage.createUser({
       email: "sarah@example.com",
       username: "sarahtech",
-      password: hashPassword("password123"),
+      password: await hashPassword("password123"),
       age: 28,
       profession: "Software Engineer",
     } as any);
@@ -3520,7 +3534,7 @@ async function seedDatabase() {
     const client2 = await storage.createUser({
       email: "john@example.com",
       username: "johnfashion",
-      password: hashPassword("password123"),
+      password: await hashPassword("password123"),
       age: 35,
       profession: "Fashion Designer",
     } as any);
@@ -3528,7 +3542,7 @@ async function seedDatabase() {
     const client3 = await storage.createUser({
       email: "maya@example.com",
       username: "mayabooks",
-      password: hashPassword("password123"),
+      password: await hashPassword("password123"),
       age: 26,
       profession: "Writer",
     } as any);
